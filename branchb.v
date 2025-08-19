@@ -550,85 +550,89 @@ Proof.
 Qed.
 
 
-(* --- Associativity of end-around-carry on 16-bit words --- *)
-
-Lemma add16_ones_assoc :
+Lemma add16_ones_assoc_case_nn :
   forall x y z,
     x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = true ->
+    (y + z <? two16) = true ->
     add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
 Proof.
-  intros x y z Hx Hy Hz.
-  (* Split on pairwise overflow tests; destruct _directly_ to get equations
-     of the form (.. <? ..) = true/false suitable for N.ltb_lt/ge. *)
-  destruct (x + y <? two16) eqn:E_xy;
-  destruct (y + z <? two16) eqn:E_yz.
-
-  - (* xy: no overflow, yz: no overflow *)
-    apply N.ltb_lt in E_xy.
-    apply N.ltb_lt in E_yz.
-    rewrite (add16_ones_no_overflow x y E_xy).
-    rewrite (add16_ones_no_overflow y z E_yz).
-    (* Outer sums are literally the same after reassociation. *)
-    unfold add16_ones at 1 2.
-    set (s := x + y + z).
-    assert ((x + y) + z = s) by (unfold s; lia).
-    assert (x + (y + z) = s) by (unfold s; lia).
-    now rewrite H, H0.
-
-  - (* xy: no overflow, yz: overflow *)
-    apply N.ltb_lt in E_xy.
-    apply N.ltb_ge in E_yz.
-    rewrite (add16_ones_no_overflow x y E_xy).
-    rewrite (add16_ones_overflow y z E_yz).
-    (* LHS outer must overflow because yz >= 2^16 ⇒ (x+y)+z >= 2^16. *)
-    assert (Hsum_ge : (x + y) + z >= two16) by lia.
-    rewrite (add16_ones_overflow (x + y) z Hsum_ge).
-    (* RHS tail is below 2^16 since x+y < 2^16 and tail ≤ y. *)
-    rewrite (add16_ones_no_overflow x (y + z - mask16)
-              (tail_lt_when_xy_no x y z Hx Hy Hz E_xy)).
-    (* Align both sides: (x+y)+z - mask16  =  x + (y+z - mask16)  since y+z >= 2^16 *)
-    rewrite (sub_add_rewrite_right x y z (two16_implies_mask16_le _ _ E_yz)).
-    reflexivity.
-
-  - (* xy: overflow, yz: no overflow *)
-    apply N.ltb_ge in E_xy.
-    apply N.ltb_lt in E_yz.
-    rewrite (add16_ones_overflow x y E_xy).
-    rewrite (add16_ones_no_overflow y z E_yz).
-    (* LHS tail < 2^16 since y+z < 2^16 and we can bound via x *)
-    (* First rewrite LHS outer into x+y+z - mask16 using mask16 <= x+y *)
-    rewrite (sub_add_rewrite_left x y z).
-    2:{ unfold two16, mask16 in *; lia. }  (* from E_xy: x+y >= two16 ⇒ mask16 <= x+y *)
-    (* Now show (x + y + z - mask16) < two16 using y+z <= mask16 and x < two16. *)
-    assert (Hyz_le : y + z <= mask16) by (unfold two16, mask16 in *; lia).
-    assert (Hle : x + y + z - mask16 <= x).
-    { apply (N.le_trans _ (x + mask16 - mask16)).
-      - apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Hyz_le.
-      - unfold mask16; lia. }
-    (* Use the no-overflow branch on the RHS outer. *)
-    rewrite (add16_ones_overflow x (y + z)).
-    2:{ rewrite <- add_assoc_N. unfold two16 in *; lia. }
-    (* And relate RHS to the same arithmetic term: *)
-    rewrite (sub_add_rewrite_left x y z).
-    2:{ unfold two16, mask16 in *; lia. }
-    (* Both sides now are x + y + z - mask16; equality holds. *)
-    reflexivity.
-
-  - (* xy: overflow, yz: overflow *)
-    apply N.ltb_ge in E_xy.
-    apply N.ltb_ge in E_yz.
-    rewrite (add16_ones_overflow x y E_xy).
-    rewrite (add16_ones_overflow y z E_yz).
-    (* Unfold both and observe sums are the same (s - mask16) on both sides. *)
-    unfold add16_ones at 1 2.
-    (* Rewrite both sums to x+y+z - mask16 using the two side conditions *)
-    rewrite (sub_add_rewrite_left  x y z).
-    2:{ unfold two16, mask16 in *; lia. }
-    rewrite (sub_add_rewrite_right x y z).
-    2:{ apply two16_implies_mask16_le; exact E_yz. }
-    reflexivity.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  apply N.ltb_lt in Hxy.
+  apply N.ltb_lt in Hyz.
+  rewrite (add16_ones_no_overflow x y Hxy).
+  rewrite (add16_ones_no_overflow y z Hyz).
+  unfold add16_ones at 1 2.
+  rewrite <- add_assoc_N.  (* x + (y + z)  ->  (x + y) + z *)
+  reflexivity.
 Qed.
 
+Lemma add16_ones_assoc_case_ny :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = true ->
+    (y + z <? two16) = false ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  apply N.ltb_lt in Hxy.
+  apply N.ltb_ge in Hyz.
+  (* Reorient the inequality with [lia] to match lemmas that expect [>=] *)
+  assert (Hyz_ge : y + z >= two16) by lia.
+
+  rewrite (add16_ones_no_overflow x y Hxy).
+  rewrite (add16_ones_overflow y z Hyz_ge).
+
+  (* (x+y)+z >= y+z >= 2^16 *)
+  assert (Hsum_ge : (x + y) + z >= two16) by lia.
+  rewrite (add16_ones_overflow (x + y) z Hsum_ge).
+
+  (* tail ≤ y and x+y < 2^16 ⇒ no overflow *)
+  rewrite (add16_ones_no_overflow x (y + z - mask16)
+            (tail_lt_when_xy_no x y z Hx Hy Hz Hxy)).
+
+  (* (x+y)+z - mask16 = x + (y+z - mask16) since y+z >= 2^16 *)
+  rewrite (sub_add_rewrite_right x y z (two16_implies_mask16_le _ _ Hyz_ge)).
+  reflexivity.
+Qed.
+
+
+Lemma add16_ones_assoc_case_yn :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = false ->
+    (y + z <? two16) = true ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  apply N.ltb_ge in Hxy.  (* x + y >= two16 *)
+  apply N.ltb_lt in Hyz.  (* y + z < two16 *)
+
+  (* Inner steps *)
+  rewrite (add16_ones_overflow x y Hxy).
+  rewrite (add16_ones_no_overflow y z Hyz).
+
+  (* LHS outer is no-overflow:
+     (x+y - mask16) + z = x + (y+z) - mask16 <= x, since y+z <= mask16. *)
+  assert (Hyz_le : y + z <= mask16) by (unfold two16, mask16 in *; lia).
+  assert (Hle : x + y + z - mask16 <= x).
+  { apply (N.le_trans _ (x + mask16 - mask16)).
+    - apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Hyz_le.
+    - unfold mask16; lia. }
+  assert (Hout_lt : (x + y - mask16) + z < two16).
+  { rewrite (sub_add_rewrite_left x y z); [| unfold two16, mask16 in *; lia ].
+    eapply N.le_lt_trans; [exact Hle| exact Hx]. }
+  rewrite (add16_ones_no_overflow (x + y - mask16) z Hout_lt).
+
+  (* RHS outer overflows since (y+z) >= y ⇒ x+(y+z) >= x+y >= 2^16 *)
+  assert (Hrhs_ge : x + (y + z) >= two16) by lia.
+  rewrite (add16_ones_overflow x (y + z) Hrhs_ge).
+
+  (* Align arithmetic terms *)
+  rewrite (sub_add_rewrite_left x y z); [| unfold two16, mask16 in *; lia ].
+  replace (x + (y + z) - mask16) with (x + y + z - mask16) by lia.
+  reflexivity.
+Qed.
 
 
 Lemma sum16_app_single : forall xs y,
