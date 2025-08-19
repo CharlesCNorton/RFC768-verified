@@ -11,6 +11,8 @@ From Coq Require Import
   Lia
   Bool
   Arith.
+  
+Require Import Coq.Init.Prelude.
 
 Import ListNotations.
 Open Scope N_scope.
@@ -540,11 +542,13 @@ Lemma sub_add_rewrite_left :
   z + (x + y - mask16) = x + y + z - mask16.
 Proof.
   intros x y z Hxy.
-  (* Commute to fit sub_add_assoc, then rewrite. *)
-  rewrite N.add_comm.
-  rewrite (sub_add_assoc (x + y) mask16 z Hxy).
-  lia.
+  (* Use your lemma: c + (a - b) = c + a - b when b <= a *)
+  rewrite (sub_add_assoc (x + y) mask16 z Hxy).     (* z + (x+y) - mask16 *)
+  (* Commute ONLY the inner sum on the LHS; keep RHS unchanged *)
+  rewrite (N.add_comm z (x + y)).                   (* (x+y) + z - mask16 *)
+  reflexivity.                                      (* same as x+y+z - mask16 *)
 Qed.
+
 
 (* --- Associativity of end-around-carry on 16-bit words --- *)
 
