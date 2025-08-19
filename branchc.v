@@ -1271,21 +1271,132 @@ Proof.
   intros h rest [Hsp [Hdp [HL Hck]]].
   unfold udp_header_bytes, udp_header_words, parse_header.
   simpl.
-  (* Use the fact that be16_of_word16 produces valid bytes *)
-  (* We need to prove the is_byte checks succeed *)
-  (* Each (x / two8) mod two8 and x mod two8 are valid bytes *)
   repeat rewrite is_byte_true_of_mod.
   simpl.
-  (* Now we need to prove the reconstructed header equals h *)
-  (* Use the fact that be16_of_word16 followed by word16_of_be is identity *)
   repeat rewrite word16_of_be_be16.
   repeat rewrite to_word16_id_if_lt by assumption.
-  (* Now we have the record with the same fields as h *)
-  (* Need to prove the record equals h *)
   f_equal. destruct h. simpl. reflexivity.
-  (* Need to provide the lt proofs for word16_of_be_be16 *)
   all: apply to_word16_lt_two16.
 Qed.
+
+(* === Helper 1: checksum material ignores the checksum field ================= *)
+
+Lemma checksum_words_ipv4_ck_invariant :
+  forall ipS ipD h data ck,
+    checksum_words_ipv4 ipS ipD
+      {| src_port := src_port h
+       ; dst_port := dst_port h
+       ; length16 := length16 h
+       ; checksum := ck |} data
+    = checksum_words_ipv4 ipS ipD h data.
+Proof.
+  intros. cbn [checksum_words_ipv4 udp_header_words_zero_ck]. reflexivity.
+Qed.
+
+(* === Helper 2: cksum16 ws = 0  ⇒  sum16 ws = 0xFFFF ======================== *)
+
+Lemma cksum16_zero_sum_allones :
+  forall ws, cksum16 ws = 0 -> sum16 ws = mask16.
+Proof.
+  intros ws H0.
+  unfold cksum16, complement16 in H0.
+  assert (Hlt : sum16 ws < two16) by apply sum16_lt_two16.
+  assert (Hle : sum16 ws <= mask16) by (unfold mask16, two16 in *; lia).
+  lia.
+Qed.
+
+(* === Helper 3: canonicalization for 0xFFFF ================================= *)
+
+Lemma to_word16_mask16_id : to_word16 mask16 = mask16.
+Proof. apply to_word16_id_if_le_mask; unfold mask16; lia. Qed.
+
+(* === Helper 4: if sum16 ws = 0xFFFF then appending 0xFFFF keeps it all-ones == *)
+
+Lemma sum16_app_mask16_of_allones :
+  forall ws, sum16 ws = mask16 -> sum16 (ws ++ [mask16]) = mask16.
+Proof.
+  intros ws Hs.
+  rewrite sum16_app_single, to_word16_mask16_id, Hs.
+  rewrite add16_ones_overflow by (unfold mask16, two16; lia).
+  reflexivity.
+Qed.
+
+Lemma tail_if_cksum_zero :
+  forall ws, (cksum16 ws =? 0) = true ->
+    ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws] = ws ++ [mask16].
+Proof. intros ws Ez. now rewrite Ez. Qed.
+
+Lemma sum16_app_if_cksum_zero :
+  forall ws, (cksum16 ws =? 0) = true ->
+    sum16 (ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws]) = mask16.
+Proof.
+  intros ws Ez.
+  rewrite (tail_if_cksum_zero ws Ez).
+  apply sum16_app_mask16_of_allones.
+  apply cksum16_zero_sum_allones. now apply N.eqb_eq in Ez.
+Qed.
+
+Lemma sum16_app_if_cksum_nonzero :
+  forall ws, (cksum16 ws =? 0) = false ->
+    sum16 (ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws]) = mask16.
+Proof.
+  intros ws Ez. rewrite Ez. simpl.
+  change (sum16 (ws ++ [cksum16 ws]) = mask16).
+  apply sum16_with_cksum_is_allones.
+Qed.
+
+Lemma sum16_app_if_cksum_zero_words :
+  forall ws ws', ws' = ws -> (cksum16 ws =? 0) = true ->
+    sum16 (ws ++ [if cksum16 ws' =? 0 then mask16 else cksum16 ws']) = mask16.
+Proof.
+  intros ws ws' Heq Hz. subst ws'. apply sum16_app_if_cksum_zero; assumption.
+Qed.
+
+Lemma sum16_app_if_cksum_zero_concrete :
+  forall ipS ipD h0 data,
+    (cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0) = true ->
+    sum16 (checksum_words_ipv4 ipS ipD h0 data ++
+           [if cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0
+            then mask16 else cksum16 (checksum_words_ipv4 ipS ipD h0 data)]) = mask16.
+Proof.
+  intros ipS ipD h0 data Ez.
+  set (ws := checksum_words_ipv4 ipS ipD h0 data).
+  rewrite (tail_if_cksum_zero ws Ez).
+  apply sum16_app_mask16_of_allones.
+  apply cksum16_zero_sum_allones. now apply N.eqb_eq in Ez.
+Qed.
+
+Lemma tail_if_cksum_nonzero :
+  forall ws, (cksum16 ws =? 0) = false ->
+    ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws] = ws ++ [cksum16 ws].
+Proof.
+  intros ws Ez. rewrite Ez; reflexivity.
+Qed.
+
+Lemma sum16_app_if_cksum_nonzero_concrete :
+  forall ipS ipD h0 data,
+    (cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0) = false ->
+    sum16 (checksum_words_ipv4 ipS ipD h0 data ++
+           [if cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0
+            then mask16 else cksum16 (checksum_words_ipv4 ipS ipD h0 data)]) = mask16.
+Proof.
+  intros ipS ipD h0 data Ez.
+  set (ws := checksum_words_ipv4 ipS ipD h0 data).
+  rewrite (tail_if_cksum_nonzero ws Ez).
+  change (sum16 (ws ++ [cksum16 ws]) = mask16).
+  apply sum16_with_cksum_is_allones.
+Qed.
+
+Lemma sum16_app_if_cksum_nonzero_words :
+  forall ws ws', ws' = ws ->
+    (cksum16 ws =? 0) = false ->
+    sum16 (ws ++ [if cksum16 ws' =? 0 then mask16 else cksum16 ws']) = mask16.
+Proof.
+  intros ws ws' Heq Hz. subst ws'. apply sum16_app_if_cksum_nonzero; exact Hz.
+Qed.
+
+
+(* === Main lemma (short, uses the helpers) ================================== *)
 
 Lemma verify_checksum_ipv4_encode_ok :
   forall ipS ipD sp dp data h0 h1,
@@ -1297,23 +1408,34 @@ Lemma verify_checksum_ipv4_encode_ok :
     verify_checksum_ipv4 ipS ipD h1 data = true.
 Proof.
   intros ipS ipD sp dp data h0 h1 Hmk ->.
-  unfold verify_checksum_ipv4, compute_udp_checksum_ipv4.
+  (* Only unfold the verifier; keep compute_udp folded so the invariant matches. *)
+  unfold verify_checksum_ipv4.
+
+  (* Replace the checksum material built from [h1] by the one from [h0]. *)
+  rewrite (checksum_words_ipv4_ck_invariant ipS ipD h0 data
+            (compute_udp_checksum_ipv4 ipS ipD h0 data)).
+
+  (* The appended singleton is just the header's checksum field. *)
+  cbn [checksum].
+
+  (* Freeze the words; only now unfold compute_udp. *)
   set (words := checksum_words_ipv4 ipS ipD h0 data).
-  remember (cksum16 words) as c.
-  destruct (N.eqb c 0) eqn:Ez.
-  - apply N.eqb_eq. simpl.
-    assert (Hs: sum16 words = mask16).
-    { apply N.eqb_eq in Ez. 
-      subst c.
-      unfold cksum16 in Ez.
-      unfold complement16 in Ez.
-      assert (Hlt: sum16 words < two16) by apply sum16_lt_two16.
-      assert (Hle: sum16 words <= mask16) by (unfold mask16, two16 in *; lia).
-      lia. }
-    rewrite <- Hs. rewrite sum16_app. simpl.
-    unfold add16_ones. rewrite N.ltb_ge; [|lia]. lia.
-  - apply N.eqb_eq. simpl. rewrite <- Heqc.
-    apply sum16_with_cksum_is_allones.
+  unfold compute_udp_checksum_ipv4.
+
+(* Split on whether the computed checksum would be zero. *)
+destruct (N.eqb (cksum16 words) 0) eqn:Ez.  (* NOTE: no [simpl] here *)
+
+(* zero branch *)
+apply N.eqb_eq.
+subst words.
+apply sum16_app_if_cksum_zero_concrete.
+exact Ez.
+
+(* nonzero branch *)
+apply N.eqb_eq.
+eapply sum16_app_if_cksum_nonzero_words.
+- reflexivity.
+- exact Ez.
 Qed.
 
 Lemma lenN_udp_header_bytes_8 :
@@ -1742,4 +1864,3 @@ Proof.
   - exact Hmk.
   - exact Henc.
 Qed.
-                               
