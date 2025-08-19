@@ -1571,58 +1571,64 @@ Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 :
     decode_udp_ipv4 defaults_ipv4 ipS ipD wire
       = Ok (to_word16 sp, to_word16 dp, data).
 Proof.
-  intros ipS ipD sp dp data wire h0 Hdp16NZ Hmk Henc.
+  intros ipS ipD sp dp data wire h0 HdpNZ Hmk Henc.
 
-  (* Header with computed checksum used by the encoder *)
+  (* Header used by encoder (checksum filled in) *)
   set (h1 :=
     {| src_port := src_port h0
      ; dst_port := dst_port h0
      ; length16 := length16 h0
      ; checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
 
-  (* Wire equality from the encoder, without heavy simpl *)
+  (* Concrete wire from encoder (no heavy simpl) *)
   pose proof (encode_udp_defaults_wire_eq_fast ipS ipD sp dp data h0 h1 wire Hmk eq_refl Henc) as Hw.
+
+  (* Decode that exact wire *)
   unfold decode_udp_ipv4. rewrite Hw. clear Hw.
 
-  (* Parser succeeds on encoder bytes *)
+  (* parse_header succeeds on encoder bytes *)
   assert (Hnorm : header_norm h1)
     by (apply (header_norm_encode_h1 sp dp (lenN data) h0 ipS ipD data Hmk)).
   rewrite (parse_header_bytes_of_header_norm h1 data Hnorm). cbn.
 
-  (* Reject policy with nonzero destination port *)
+  (* Port-0 policy under Reject with nonzero destination port *)
   cbn [defaults_ipv4].
-  destruct (h1_ports_eq ipS ipD sp dp data h0 h1 Hmk eq_refl) as [Hsp1 Hdp1].
-  assert (Hdp0 : N.eqb (dst_port h1) 0 = false)
-    by (rewrite Hdp1; apply N.eqb_neq; exact Hdp16NZ).
-(* Replace the failing [rewrite Hdp0. cbn.] with: *)
-rewrite (dst_port0_test_reject_nonzero_h0 sp dp data h0 Hmk Hdp16NZ).
-cbn.
+  rewrite (dst_port0_test_reject_nonzero_h0 sp dp data h0 Hmk HdpNZ). cbn.
 
-
-  (* Length checks (StrictEq) *)
+  (* Length checks under StrictEq *)
+  cbn [defaults_ipv4].
+  (* Name and normalize totals *)
   set (Nbytes := lenN (udp_header_bytes h1 ++ data)).
   set (L := length16 h1).
-subst Nbytes.
-rewrite (lenN_wire_from_header_bytes h1 data).
-
-  rewrite (length16_h1_total_len ipS ipD sp dp data h0 h1 Hmk eq_refl).
+  replace Nbytes with (8 + lenN data)
+    by (subst Nbytes; apply lenN_wire_from_header_bytes).
+  replace L with (8 + lenN data)
+    by (apply (length16_h1_total_len ipS ipD sp dp data h0 h1); [exact Hmk|reflexivity]).
   rewrite N.ltb_ge by lia.    (* L >= 8 *)
   rewrite N.ltb_ge by lia.    (* Nbytes >= L (actually =) *)
-  cbn [defaults_ipv4].
   rewrite (N.eqb_eq (8 + lenN data) (8 + lenN data)) by lia.
 
-  (* Checksum is nonzero on transmit *)
+  (* Checksum is nonzero on IPv4 transmit *)
   rewrite (checksum_h1_eqb_zero_false ipS ipD sp dp data h0 h1 Hmk eq_refl).
 
   (* Delivered slice equals original payload *)
-  rewrite (delivered_eq_data byte data (8 + lenN data)) by reflexivity.
+  set (delivered_len_N := (8 + lenN data) - 8).
+  set (delivered_len := N.to_nat delivered_len_N).
+  set (delivered := take delivered_len data).
+  assert (Hdel : delivered = data).
+  { subst delivered delivered_len delivered_len_N.
+    eapply delivered_eq_data. reflexivity. }
+  rewrite Hdel.
 
-  (* Verifier succeeds for encoder-produced checksum *)
+  (* Verifier succeeds on encoder-produced checksum *)
   rewrite (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1 Hmk eq_refl).
 
-  (* Final tuple *)
-  f_equal; [exact Hsp1 | exact Hdp1 | reflexivity].
+  (* Return tuple *)
+  destruct (h1_ports_eq ipS ipD sp dp data h0 h1 Hmk eq_refl) as [Hsp Hdp].
+  f_equal; [exact Hsp | exact Hdp | reflexivity].
 Qed.
+
+
 
 Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 :
   forall ipS ipD sp dp data wire h0,
@@ -2053,4 +2059,3 @@ Proof.
   - exact Hmk.
   - exact Henc.
 Qed.
-                              
