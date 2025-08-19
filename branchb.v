@@ -471,18 +471,10 @@ Proof.
   intros x y Hx Hy Hsum.
   pose proof (sum_bound_double x y Hx Hy) as Hdouble.
   unfold two16, mask16 in *.
-  (* We know x + y < 131072 and x + y >= 65536 *)
-  (* So x + y - 65535 < 131072 - 65535 = 65537 *)
-  (* And 65537 < 65536 is false, so we need to be more careful *)
-  (* Actually x + y - 65535 <= 131071 - 65535 = 65536 *)
-  (* But we need strict inequality *)
   assert (x + y <= 131071) by lia.
   assert (x + y - 65535 <= 65536) by lia.
   (* Since x + y >= 65536, we have x + y - 65535 >= 1 *)
   assert (x + y - 65535 >= 1) by lia.
-  (* The maximum is when x + y = 131071, giving 131071 - 65535 = 65536 *)
-  (* But that's not < 65536. Let me reconsider... *)
-  (* Wait, x < 65536 and y < 65536, so x + y <= 65535 + 65535 = 131070 *)
   assert (x + y <= 65535 + 65535) by lia.
   assert (65535 + 65535 = 131070) by reflexivity.
   assert (x + y <= 131070) by lia.
@@ -596,6 +588,138 @@ Proof.
   reflexivity.
 Qed.
 
+(* Convenience orientation: accepts "two16 <= x+y" form *)
+Lemma add16_ones_overflow_le :
+  forall x y, two16 <= x + y -> add16_ones x y = x + y - mask16.
+Proof.
+  intros x y H.
+  apply add16_ones_overflow. lia.
+Qed.
+
+Lemma add16_ones_ext_by_sum :
+  forall a b c d,
+    a + b = c + d ->
+    add16_ones a b = add16_ones c d.
+Proof.
+  intros a b c d Heq.
+  unfold add16_ones.
+  now rewrite Heq.
+Qed.
+
+Lemma mask16_le_two16 : mask16 <= two16.
+Proof. cbv [mask16 two16]; lia. Qed.
+
+Lemma overflow_info :
+  forall x y, (x + y <? two16) = false ->
+  two16 <= x + y /\ mask16 <= x + y.
+Proof.
+  intros x y H.
+  apply N.ltb_ge in H. (* two16 <= x + y *)
+  split; [ exact H | eapply N.le_trans; [apply mask16_le_two16 | exact H] ].
+Qed.
+
+(* Align the outer sums when both inner pairs overflow (ltb=false premises). *)
+Lemma sums_align_both_overflow :
+  forall x y z,
+    (x + y <? two16) = false ->
+    (y + z <? two16) = false ->
+    (x + y - mask16) + z = x + (y + z - mask16).
+Proof.
+  intros x y z Hxy Hyz.
+  destruct (overflow_info x y Hxy) as [_ Hxy_mle].  (* mask16 <= x+y *)
+  destruct (overflow_info y z Hyz) as [_ Hyz_mle].  (* mask16 <= y+z *)
+  rewrite (N.add_comm (x + y - mask16) z).
+  rewrite (sub_add_rewrite_left  x y z Hxy_mle).
+  rewrite (sub_add_rewrite_right x y z Hyz_mle).
+  reflexivity.
+Qed.
+
+Lemma add16_ones_overflow_ltb_false :
+  forall x y,
+    (x + y <? two16) = false ->
+    add16_ones x y = x + y - mask16.
+Proof.
+  intros x y H.
+  apply N.ltb_ge in H.                (* two16 <= x + y *)
+  apply add16_ones_overflow; lia.     (* x + y >= two16 *)
+Qed.
+
+Lemma add16_ones_assoc_case_yy :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = false ->
+    (y + z <? two16) = false ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z _ _ _ Hxy Hyz.
+  rewrite (add16_ones_overflow_ltb_false x y Hxy).
+  rewrite (add16_ones_overflow_ltb_false y z Hyz).
+  apply add16_ones_ext_by_sum.
+  apply (sums_align_both_overflow x y z); assumption.
+Qed.
+
+Lemma add16_ones_no_overflow_ltb_true :
+  forall x y,
+    (x + y <? two16) = true ->
+    add16_ones x y = x + y.
+Proof.
+  intros x y H.
+  apply N.ltb_lt in H.
+  apply add16_ones_no_overflow; exact H.
+Qed.
+
+
+(* If t ≤ mask16, then x + t - mask16 is strictly below 2^16 whenever x is. *)
+Lemma add_minus_mask16_lt_two16 :
+  forall x t, x < two16 -> t <= mask16 -> x + t - mask16 < two16.
+Proof.
+  intros x t Hx Ht.
+  assert (Hle : x + t - mask16 <= x + mask16 - mask16).
+  { apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Ht. }
+  replace (x + mask16 - mask16) with x in Hle by lia.
+  eapply N.le_lt_trans; [exact Hle| exact Hx].
+Qed.
+
+
+Lemma add16_ones_assoc_case_yn :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = false ->
+    (y + z <? two16) = true ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  (* Reduce the two inner sums by their tests *)
+  rewrite (add16_ones_overflow_ltb_false x y Hxy).
+  rewrite (add16_ones_no_overflow_ltb_true y z Hyz).
+
+  (* From overflow on x+y, get mask16 <= x+y *)
+  destruct (overflow_info x y Hxy) as [Hxy_ge Hxy_mle].
+
+  (* From no-overflow on y+z, get y+z <= mask16 *)
+  apply N.ltb_lt in Hyz.
+  assert (Hyz_le : y + z <= mask16) by (unfold two16, mask16 in *; lia).
+
+  (* LHS outer is no-overflow: ((x+y)-mask16)+z < 2^16 *)
+  assert (Hout_lt : (x + y - mask16) + z < two16).
+  { rewrite N.add_comm.
+    rewrite (sub_add_rewrite_left x y z Hxy_mle).
+    replace (x + y + z - mask16) with (x + (y + z) - mask16) by lia.
+    assert (Htail_le_x : x + (y + z) - mask16 <= x)
+      by (apply N.sub_le_mono_r; apply N.add_le_mono_l; exact Hyz_le).
+    eapply N.le_lt_trans; [exact Htail_le_x | exact Hx]. }
+  rewrite (add16_ones_no_overflow (x + y - mask16) z Hout_lt).
+
+  (* RHS outer overflows: x + (y+z) >= x + y >= 2^16 *)
+  assert (Hrhs_ge : x + (y + z) >= two16) by lia.
+  rewrite (add16_ones_overflow x (y + z) Hrhs_ge).
+
+  (* Align arithmetic on both sides *)
+  rewrite N.add_comm with (n := x + y - mask16) (m := z).
+  rewrite (sub_add_rewrite_left x y z Hxy_mle).
+  replace (x + y + z - mask16) with (x + (y + z) - mask16) by lia.
+  reflexivity.
+Qed.
 
 Lemma add16_ones_assoc_case_yn :
   forall x y z,
@@ -608,8 +732,10 @@ Proof.
   apply N.ltb_ge in Hxy.  (* x + y >= two16 *)
   apply N.ltb_lt in Hyz.  (* y + z < two16 *)
 
-  (* Inner steps *)
-  rewrite (add16_ones_overflow x y Hxy).
+
+assert (Hxy_ge : x + y >= two16) by lia.
+rewrite (add16_ones_overflow x y Hxy_ge).
+
   rewrite (add16_ones_no_overflow y z Hyz).
 
   (* LHS outer is no-overflow:
@@ -633,7 +759,6 @@ Proof.
   replace (x + (y + z) - mask16) with (x + y + z - mask16) by lia.
   reflexivity.
 Qed.
-
 
 Lemma sum16_app_single : forall xs y,
   sum16 (xs ++ [y]) = add16_ones (sum16 xs) (to_word16 y).
