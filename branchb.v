@@ -493,147 +493,139 @@ Proof.
   exact H9.
 Qed.
 
-Lemma add16_ones_assoc : forall x y z,
-  x < two16 -> y < two16 -> z < two16 ->
-  add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+
+(* --- Small helpers with the right side conditions --- *)
+
+(* For any y,z with z < 2^16, the tail (y+z - mask16) is <= y. *)
+Lemma tail_le_y : forall y z,
+  z < two16 -> y + z - mask16 <= y.
+Proof.
+  intros y z Hz.
+  assert (Hz_le : z <= mask16) by (unfold mask16, two16 in *; lia).
+  (* Monotonicity of subtraction on the right: *)
+  assert (Hmono : y + z - mask16 <= y + mask16 - mask16).
+  { apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Hz_le. }
+  (* Reduce RHS to y and conclude *)
+  replace (y + mask16 - mask16) with y in Hmono by lia.
+  exact Hmono.
+Qed.
+
+
+(* 2) If x+y doesn't overflow, then x + (y+z - mask16) is also below 2^16. *)
+Lemma tail_lt_when_xy_no :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 -> x + y < two16 ->
+    x + (y + z - mask16) < two16.
+Proof.
+  intros x y z Hx Hy Hz Hxy.
+  pose proof (tail_le_y y z Hz) as Htail.
+  assert (Hxy_le : x + y <= mask16) by (unfold mask16, two16 in *; lia).
+  assert (Hsum_le : x + (y + z - mask16) <= x + y) by (apply N.add_le_mono_l; exact Htail).
+  unfold two16, mask16 in *; lia.
+Qed.
+
+(* 3) Rewrite x + (y+z - mask16) to x + y + z - mask16 when mask16 <= y+z. *)
+Lemma sub_add_rewrite_right :
+  forall x y z, mask16 <= y + z ->
+  x + (y + z - mask16) = x + y + z - mask16.
+Proof.
+  intros x y z Hyz.
+  (* Use your earlier lemma: sub_add_assoc : b <= a -> c + (a - b) = c + a - b *)
+  rewrite (sub_add_assoc (y + z) mask16 x Hyz). lia.
+Qed.
+
+(* 4) Symmetric rewrite on the left when mask16 <= x+y. *)
+Lemma sub_add_rewrite_left :
+  forall x y z, mask16 <= x + y ->
+  z + (x + y - mask16) = x + y + z - mask16.
+Proof.
+  intros x y z Hxy.
+  (* Commute to fit sub_add_assoc, then rewrite. *)
+  rewrite N.add_comm.
+  rewrite (sub_add_assoc (x + y) mask16 z Hxy).
+  lia.
+Qed.
+
+(* --- Associativity of end-around-carry on 16-bit words --- *)
+
+Lemma add16_ones_assoc :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
 Proof.
   intros x y z Hx Hy Hz.
-  unfold add16_ones, mask16, two16.
-  destruct (x + y <? 65536) eqn:E1;
-  destruct (y + z <? 65536) eqn:E2.
-  - (* No overflow in either case *)
-    destruct ((x + y) + z <? 65536) eqn:E3;
-    destruct (x + (y + z) <? 65536) eqn:E4.
-    + assert (x + y + z = x + (y + z)) by lia.
-      rewrite <- H. reflexivity.
-    + apply N.ltb_lt in E1. apply N.ltb_lt in E2.
-      apply N.ltb_lt in E3. apply N.ltb_ge in E4.
-      assert (x + y + z < 65536) by lia.
-      assert (x + (y + z) >= 65536) by lia.
-      assert (y + z < 65536) by lia.
-      lia.
-    + apply N.ltb_lt in E1. apply N.ltb_lt in E2.
-      apply N.ltb_ge in E3. apply N.ltb_lt in E4.
-      assert ((x + y) + z >= 65536) by lia.
-      assert (x + (y + z) < 65536) by lia.
-      assert (x + y < 65536) by lia.
-      lia.
-    + assert (x + y + z = x + (y + z)) by lia.
-      rewrite <- H. reflexivity.
-  - (* y + z overflows *)
-    apply N.ltb_lt in E1. apply N.ltb_ge in E2.
-    assert (Hxy: x + y < 65536) by lia.
-    assert (Hyz: y + z >= 65536) by lia.
-    (* When y+z overflows, add16_ones y z = y + z - 65535 *)
-    (* So we're comparing add16_ones (x+y) z with add16_ones x (y+z-65535) *)
-    destruct ((x + y) + z <? 65536) eqn:E3;
-    destruct (x + (y + z - 65535) <? 65536) eqn:E4.
-    + (* Both don't overflow *)
-      apply N.ltb_lt in E3. apply N.ltb_lt in E4.
-      (* add16_ones (x+y) z = (x+y) + z *)
-      (* add16_ones x (y+z-65535) = x + (y+z-65535) *)
-      (* Need: (x+y) + z = x + (y+z-65535) *)
-      assert (x + y + z = x + (y + z)) by lia.
-      assert (x + (y + z - 65535) = x + y + z - 65535) by lia.
-      assert ((x + y) + z = x + y + z) by lia.
-      (* This can't be equal, so this case is impossible *)
-      assert (x + y + z < 65536) by lia.
-      assert (y + z < 2 * 65536) by (apply sum_bound_double; auto).
-      assert (y + z - 65535 < 65536) by lia.
-      assert (x + (y + z - 65535) < 2 * 65536) by lia.
-      (* Since y + z >= 65536, we have y + z - 65535 >= 1 *)
-      assert (y + z - 65535 >= 1) by lia.
-      (* So x + (y + z - 65535) >= x + 1 > x *)
-      (* And (x + y) + z = x + y + z >= x + 65536 since y + z >= 65536... no *)
-      (* Actually (x + y) + z = x + y + z, and y + z >= 65536 *)
-      (* But x + y < 65536, so x + y + z < 65536 + z < 2*65536 *)
-      (* And x + (y + z - 65535) = x + y + z - 65535 *)
-      (* If both < 65536, then x + y + z < 65536 and x + y + z - 65535 < 65536 *)
-      (* This means x + y + z < 65536, but also x + y + z >= 65536 + 65535 = impossible *)
-      (* Let's see: y + z >= 65536, z < 65536, so y >= 1 *)
-      (* x + y + z >= x + y + 0 = x + y *)
-      (* But also x + y + z = x + (y + z) >= x + 65536 >= 65536, contradiction with E3 *)
-      exfalso. lia.
-    + apply N.ltb_lt in E3. apply N.ltb_ge in E4.
-      (* (x+y)+z doesn't overflow, x+(y+z-65535) does overflow *)
-      assert ((x + y) + z < 65536) by lia.
-      assert (x + (y + z - 65535) >= 65536) by lia.
-      exfalso.
-      assert (x + y + z = (x + y) + z) by lia.
-      assert (x + y + z = x + (y + z)) by lia.
-      assert (x + (y + z - 65535) = x + y + z - 65535) by lia.
-      lia.
-    + apply N.ltb_ge in E3. apply N.ltb_lt in E4.
-      assert ((x + y) + z >= 65536) by lia.
-      assert (x + (y + z - 65535) < 65536) by lia.
-      (* LHS: add16_ones (x+y) z overflows, so result is (x+y)+z-65535 *)
-      (* RHS: add16_ones x (y+z-65535) doesn't overflow, so result is x+(y+z-65535) *)
-      (* Apply our micro lemma that handles the conditional *)
-      unfold mask16, two16 in *.
-      apply add16_ones_assoc_yz_overflow_with_cond.
-      * exact Hx.
-      * exact Hy.
-      * exact Hz.
-      * unfold two16. exact Hxy.  (* x + y < 65536 *)
-      * unfold two16. exact Hyz.  (* y + z >= 65536 *)
-      * unfold two16. exact H.  (* x + y + z >= 65536 *)
-      * unfold two16, mask16. exact H0.  (* x + (y + z - 65535) < 65536 *)
-    + apply N.ltb_ge in E3. apply N.ltb_ge in E4.
-      (* This is actually still the y+z overflow case where RHS also overflows *)
-      f_equal.
-      (* The goal is showing (x+y)+z-65535 = (x+(y+z-65535))-65535 *)
-      (* when x+(y+z-65535) >= 65536, the RHS becomes x+(y+z-65535)-65535 *)
-      assert (H1: (x + y) + z - 65535 = x + y + z - 65535) by lia.
-      assert (H2: x + (y + z - 65535) = x + y + z - 65535).
-      { apply overflow_arithmetic_eq; try assumption. }
-      (* So the RHS is (x + y + z - 65535) - 65535 = x + y + z - 65535 - 65535 *)
-      (* But LHS is only x + y + z - 65535 *)
-      (* This suggests the cases were set up wrong, let me just use lia for now *)
-      (* Complex arithmetic case - need a stronger lemma for this *)
-      (* Since lia is failing, let's create one final micro lemma for all remaining cases *)
-      sorry.
-  - (* x + y overflows *)
-    apply N.ltb_ge in E1. apply N.ltb_lt in E2.
-    assert (x + y >= 65536) by lia.
-    assert (y + z < 65536) by lia.
-    destruct ((x + y - 65535) + z <? 65536) eqn:E3;
-    destruct (x + (y + z) <? 65536) eqn:E4.
-    + apply N.ltb_lt in E3. apply N.ltb_lt in E4.
-      f_equal. lia.
-    + apply N.ltb_lt in E3. apply N.ltb_ge in E4.
-      assert ((x + y - 65535) + z < 65536) by lia.
-      assert (x + (y + z) >= 65536) by lia.
-      assert (x + y < 2 * 65536) by lia.
-      f_equal. lia.
-    + apply N.ltb_ge in E3. apply N.ltb_lt in E4.
-      assert ((x + y - 65535) + z >= 65536) by lia.
-      assert (x + (y + z) < 65536) by lia.
-      f_equal. lia.
-    + apply N.ltb_ge in E3. apply N.ltb_ge in E4.
-      f_equal. lia.
-  - (* Both overflow *)
-    apply N.ltb_ge in E1. apply N.ltb_ge in E2.
-    assert (x + y >= 65536) by lia.
-    assert (y + z >= 65536) by lia.
-    destruct ((x + y - 65535) + z <? 65536) eqn:E3;
-    destruct (x + (y + z - 65535) <? 65536) eqn:E4.
-    + apply N.ltb_lt in E3. apply N.ltb_lt in E4.
-      f_equal. lia.
-    + apply N.ltb_lt in E3. apply N.ltb_ge in E4.
-      assert ((x + y - 65535) + z < 65536) by lia.
-      assert (x + (y + z - 65535) >= 65536) by lia.
-      assert (x + y < 2 * 65536) by lia.
-      assert (y + z < 2 * 65536) by lia.
-      f_equal. lia.
-    + apply N.ltb_ge in E3. apply N.ltb_lt in E4.
-      assert ((x + y - 65535) + z >= 65536) by lia.
-      assert (x + (y + z - 65535) < 65536) by lia.
-      assert (x + y < 2 * 65536) by lia.
-      assert (y + z < 2 * 65536) by lia.
-      f_equal. lia.
-    + apply N.ltb_ge in E3. apply N.ltb_ge in E4.
-      f_equal. lia.
+  (* Split on pairwise overflow tests; destruct _directly_ to get equations
+     of the form (.. <? ..) = true/false suitable for N.ltb_lt/ge. *)
+  destruct (x + y <? two16) eqn:E_xy;
+  destruct (y + z <? two16) eqn:E_yz.
+
+  - (* xy: no overflow, yz: no overflow *)
+    apply N.ltb_lt in E_xy.
+    apply N.ltb_lt in E_yz.
+    rewrite (add16_ones_no_overflow x y E_xy).
+    rewrite (add16_ones_no_overflow y z E_yz).
+    (* Outer sums are literally the same after reassociation. *)
+    unfold add16_ones at 1 2.
+    set (s := x + y + z).
+    assert ((x + y) + z = s) by (unfold s; lia).
+    assert (x + (y + z) = s) by (unfold s; lia).
+    now rewrite H, H0.
+
+  - (* xy: no overflow, yz: overflow *)
+    apply N.ltb_lt in E_xy.
+    apply N.ltb_ge in E_yz.
+    rewrite (add16_ones_no_overflow x y E_xy).
+    rewrite (add16_ones_overflow y z E_yz).
+    (* LHS outer must overflow because yz >= 2^16 ⇒ (x+y)+z >= 2^16. *)
+    assert (Hsum_ge : (x + y) + z >= two16) by lia.
+    rewrite (add16_ones_overflow (x + y) z Hsum_ge).
+    (* RHS tail is below 2^16 since x+y < 2^16 and tail ≤ y. *)
+    rewrite (add16_ones_no_overflow x (y + z - mask16)
+              (tail_lt_when_xy_no x y z Hx Hy Hz E_xy)).
+    (* Align both sides: (x+y)+z - mask16  =  x + (y+z - mask16)  since y+z >= 2^16 *)
+    rewrite (sub_add_rewrite_right x y z (two16_implies_mask16_le _ _ E_yz)).
+    reflexivity.
+
+  - (* xy: overflow, yz: no overflow *)
+    apply N.ltb_ge in E_xy.
+    apply N.ltb_lt in E_yz.
+    rewrite (add16_ones_overflow x y E_xy).
+    rewrite (add16_ones_no_overflow y z E_yz).
+    (* LHS tail < 2^16 since y+z < 2^16 and we can bound via x *)
+    (* First rewrite LHS outer into x+y+z - mask16 using mask16 <= x+y *)
+    rewrite (sub_add_rewrite_left x y z).
+    2:{ unfold two16, mask16 in *; lia. }  (* from E_xy: x+y >= two16 ⇒ mask16 <= x+y *)
+    (* Now show (x + y + z - mask16) < two16 using y+z <= mask16 and x < two16. *)
+    assert (Hyz_le : y + z <= mask16) by (unfold two16, mask16 in *; lia).
+    assert (Hle : x + y + z - mask16 <= x).
+    { apply (N.le_trans _ (x + mask16 - mask16)).
+      - apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Hyz_le.
+      - unfold mask16; lia. }
+    (* Use the no-overflow branch on the RHS outer. *)
+    rewrite (add16_ones_overflow x (y + z)).
+    2:{ rewrite <- add_assoc_N. unfold two16 in *; lia. }
+    (* And relate RHS to the same arithmetic term: *)
+    rewrite (sub_add_rewrite_left x y z).
+    2:{ unfold two16, mask16 in *; lia. }
+    (* Both sides now are x + y + z - mask16; equality holds. *)
+    reflexivity.
+
+  - (* xy: overflow, yz: overflow *)
+    apply N.ltb_ge in E_xy.
+    apply N.ltb_ge in E_yz.
+    rewrite (add16_ones_overflow x y E_xy).
+    rewrite (add16_ones_overflow y z E_yz).
+    (* Unfold both and observe sums are the same (s - mask16) on both sides. *)
+    unfold add16_ones at 1 2.
+    (* Rewrite both sums to x+y+z - mask16 using the two side conditions *)
+    rewrite (sub_add_rewrite_left  x y z).
+    2:{ unfold two16, mask16 in *; lia. }
+    rewrite (sub_add_rewrite_right x y z).
+    2:{ apply two16_implies_mask16_le; exact E_yz. }
+    reflexivity.
 Qed.
+
+
 
 Lemma sum16_app_single : forall xs y,
   sum16 (xs ++ [y]) = add16_ones (sum16 xs) (to_word16 y).
@@ -1607,7 +1599,7 @@ Proof.
   simpl. reflexivity.
 Qed.
 
-(* NEW: example documenting RFC 768 "source port optional (0 permitted)". *)
+(* Example documenting RFC 768 "source port optional (0 permitted)". *)
 Example EX_roundtrip_src_port_zero :
   forall wire h0,
     mk_header 0 9999 (lenN EX_data) = Some h0 ->
@@ -1622,3 +1614,4 @@ Proof.
   - exact Hmk.
   - exact Henc.
 Qed.
+                               
