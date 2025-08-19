@@ -1562,6 +1562,49 @@ Proof.
   rewrite Hdp. apply N.eqb_neq. exact Hnz.
 Qed.
 
+Lemma decode_defaults_stricteq_nonzero_ok :
+  forall ipS ipD h data,
+    header_norm h ->
+    N.eqb (dst_port h) 0 = false ->
+    length16 h = 8 + lenN data ->
+    N.eqb (checksum h) 0 = false ->
+    verify_checksum_ipv4 ipS ipD h data = true ->
+    decode_udp_ipv4 defaults_ipv4 ipS ipD (udp_header_bytes h ++ data)
+      = Ok (src_port h, dst_port h, data).
+Proof.
+  intros ipS ipD h data Hnorm Hdp0 HLen Hcknz Hver.
+  unfold decode_udp_ipv4.
+  rewrite (parse_header_bytes_of_header_norm h data Hnorm). cbn.
+  cbn [defaults_ipv4].
+  rewrite Hdp0. cbn.
+
+  (* Length checks under StrictEq *)
+  cbn [defaults_ipv4].
+  set (Nbytes := lenN (udp_header_bytes h ++ data)).
+  set (L := length16 h).
+  assert (HNbytes : Nbytes = 8 + lenN data)
+    by (subst Nbytes; apply lenN_wire_from_header_bytes).
+  rewrite HNbytes, HLen.
+  rewrite N.ltb_ge by lia.    (* L >= 8 *)
+  rewrite N.ltb_ge by lia.    (* Nbytes >= L (actually =) *)
+  rewrite (N.eqb_eq (8 + lenN data) (8 + lenN data)) by lia.
+
+  (* Checksum nonzero path *)
+  rewrite Hcknz.
+
+  (* Delivered slice equals data *)
+  set (delivered_len_N := (8 + lenN data) - 8).
+  set (delivered_len := N.to_nat delivered_len_N).
+  set (delivered := take delivered_len data).
+  assert (Hdel : delivered = data).
+  { subst delivered delivered_len delivered_len_N.
+    eapply delivered_eq_data. reflexivity. }
+  rewrite Hdel.
+
+  (* Verifier holds *)
+  now rewrite Hver.
+Qed.
+
 
 Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 :
   forall ipS ipD sp dp data wire h0,
