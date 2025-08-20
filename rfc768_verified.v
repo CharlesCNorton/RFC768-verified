@@ -2151,3 +2151,187 @@ Proof.
   inversion Hparse; subst; split; reflexivity.
 Qed.
 
+Section UDP_Decode_Encode_Completeness.
+  Open Scope N_scope.
+
+  (** Auxiliary: round‑trip on bytes for BE16 at the byte level. *)
+  Lemma be16_of_word16_word16_of_be_id :
+    forall b0 b1,
+      is_byte b0 = true -> is_byte b1 = true ->
+      be16_of_word16 (word16_of_be b0 b1) = (b0, b1).
+  Proof.
+    intros b0 b1 Hb0 Hb1.
+    pose proof (is_byte_lt_two8 b0 Hb0) as Hb0_lt.
+    pose proof (is_byte_lt_two8 b1 Hb1) as Hb1_lt.
+    unfold be16_of_word16, word16_of_be.
+    (* Low byte: (b0*256 + b1) mod 256 = b1 *)
+    assert (Hlo : (b0 * two8 + b1) mod two8 = b1).
+    { rewrite N.add_comm.
+      rewrite N.add_mod by (unfold two8; lia).
+      rewrite N.mod_mul by (unfold two8; lia).
+      rewrite N.mod_small by exact Hb1_lt.
+      rewrite N.add_0_l.
+      rewrite N.mod_small by exact Hb1_lt.
+      reflexivity. }
+    (* High byte: ((b0*256 + b1) / 256) mod 256 = b0 *)
+    assert (Hhi : ((b0 * two8 + b1) / two8) mod two8 = b0).
+    { replace ((b0 * two8 + b1) / two8)
+        with (b0 + (b1 / two8))
+        by (rewrite N.add_comm;
+            rewrite N.add_div by (unfold two8; lia);
+            now rewrite N.mul_comm, N.mul_div_r by (unfold two8; lia)).
+      rewrite N.div_small by exact Hb1_lt.
+      rewrite N.add_0_r.
+      now rewrite N.mod_small by exact Hb0_lt. }
+    now rewrite Hhi, Hlo.
+  Qed.
+
+  (** Any successful parse reveals that the wire is exactly header‑bytes ++ rest. *)
+  Lemma parse_header_shape_bytes :
+    forall w h rest,
+      parse_header w = Some (h, rest) ->
+      w = udp_header_bytes h ++ rest.
+  Proof.
+    intros w h rest H.
+    unfold parse_header in H.
+    (* Decompose the first eight bytes of [w]. *)
+    destruct w as [|s0 w]; try discriminate.
+    destruct w as [|s1 w]; try discriminate.
+    destruct w as [|d0 w]; try discriminate.
+    destruct w as [|d1 w]; try discriminate.
+    destruct w as [|l0 w]; try discriminate.
+    destruct w as [|l1 w]; try discriminate.
+    destruct w as [|c0 w]; try discriminate.
+    destruct w as [|c1 rest0]; try discriminate.
+    cbn in H.
+    set (header8 := [s0; s1; d0; d1; l0; l1; c0; c1]).
+    destruct (forallb is_byte header8) eqn:Hall; try discriminate.
+    inversion H; subst h rest; clear H.
+    (* Extract byte‑range facts from [Hall]. *)
+    cbn in Hall.
+    repeat (apply Bool.andb_true_iff in Hall as [? Hall]).
+    (* Equality of the first 8 bytes with [udp_header_bytes h]. *)
+    unfold udp_header_bytes, udp_header_words; cbn.
+    rewrite !to_word16_id_if_lt
+      by (eapply word16_of_be_lt_two16_of_is_byte; eauto).
+    rewrite (be16_of_word16_word16_of_be_id s0 s1); try assumption.
+    rewrite (be16_of_word16_word16_of_be_id d0 d1); try assumption.
+    rewrite (be16_of_word16_word16_of_be_id l0 l1); try assumption.
+    rewrite (be16_of_word16_word16_of_be_id c0 c1); try assumption.
+    reflexivity.
+  Qed.
+
+  (** Decoder→Encoder completeness for defaults (StrictEq), non‑zero checksum on wire. *)
+  Theorem decode_encode_completeness_defaults_nonzero_ck :
+    forall ipS ipD w sp dp data h rest,
+      decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+      parse_header w = Some (h, rest) ->
+      N.eqb (checksum h) 0 = false ->
+      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok w.
+  Proof.
+    intros ipS ipD w sp dp data h rest Hdec Hparse Hck_nz.
+
+    (* Invariants extracted from the decoding path (defaults = StrictEq). *)
+    assert (Hnorm : header_norm h) by (apply header_norm_of_parse_success with (w:=w) (rest:=rest); exact Hparse).
+
+    (* The decode path under defaults with non‑zero checksum must go through verification
+       and StrictEq length equality; from this we get L = 8 + |data| and rest = data. *)
+    unfold decode_udp_ipv4 in Hdec.
+    rewrite Hparse in Hdec.
+    (* Destination‑port‑0 is rejected by defaults, so the [eqb] test must be false. *)
+    assert (Epol : dst_port0_policy defaults_ipv4 = Reject) by reflexivity.
+    rewrite Epol in Hdec.
+    rewrite Hck_nz in Hdec.  (* take the non‑zero‑checksum branch *)
+    (* Name length quantities. *)
+    set (Nbytes := lenN w) in *.
+    set (L := length16 h) in *.
+    (* Under StrictEq we must have Nbytes = L; produce that equality. *)
+    assert (Emode : length_rx_mode defaults_ipv4 = StrictEq) by reflexivity.
+    rewrite Emode in Hdec.
+    (* Discharge the length guards: L ≥ 8 and Nbytes ≥ L, and finally Nbytes = L. *)
+    (* These follow because the only remaining branch returning [Ok] under defaults is the
+       one where [Nbytes = L] (StrictEq). We reason by cases on the tests appearing in Hdec. *)
+    destruct (L <? 8) eqn:EL8; [discriminate|].
+    destruct (Nbytes <? L) eqn:ENbL; [discriminate|].
+    destruct (N.eqb Nbytes L) eqn:EEq; [|discriminate].
+    (* The success we have must be exactly this branch: *)
+    simpl in Hdec.
+
+    (* From the successful branch we learn that the verifier succeeded on [delivered],
+       and that the returned tuple equals (src_port h, dst_port h, delivered). *)
+    remember (take (N.to_nat (L - 8)) rest) as delivered.
+    destruct (verify_checksum_ipv4 ipS ipD h delivered) eqn:Hver; [|discriminate].
+    inversion Hdec; subst sp dp data; clear Hdec.
+
+    (* Under StrictEq and [Nbytes = L], the delivered slice is the whole [rest]. *)
+    assert (Hlen_eq : Nbytes = L) by (apply N.eqb_eq; exact EEq).
+    assert (Hrest_eq : delivered = rest).
+    { subst delivered Nbytes L.
+      rewrite N_to_nat_lenN.
+      replace (lenN rest) with (length16 h - 8) by
+        (unfold lenN; rewrite parse_header_shape_bytes in Hlen_eq;
+         [ |exact Hparse];
+         (* from w = header ++ rest, lenN w = 8 + lenN rest *)
+         cbn in Hlen_eq; rewrite lenN_app, lenN_udp_header_bytes_8 in Hlen_eq; lia).
+      rewrite N_to_nat_lenN, take_length_id; reflexivity. }
+
+    subst delivered.
+
+    (* Canonicalize the checksum field: under non‑zero transmitted checksum we get
+       [checksum h = compute_udp_checksum_ipv4 ipS ipD h rest]. *)
+    pose proof (verify_implies_checksum_equals_computed_nonzero_split
+                  ipS ipD h rest Hnorm Hver Hck_nz) as Hck_eq.
+
+    (* Build the encoder’s header and show it coincides with [h]. *)
+    assert (Hmk_ok : 8 + lenN rest <= mask16).
+    { (* L = 8 + |rest| and L < 2^16 (from [header_norm]) *)
+      destruct Hnorm as [_ [_ [HL_lt _]]].
+      assert (HL_eq : L = 8 + lenN rest).
+      { (* as above from [Nbytes = L] and [w = header ++ rest] *)
+        subst Nbytes L.
+        rewrite parse_header_shape_bytes in EEq; [ |exact Hparse].
+        cbn in EEq. apply N.eqb_eq in EEq.
+        rewrite lenN_app, lenN_udp_header_bytes_8 in EEq. exact EEq. }
+      rewrite HL_eq. unfold mask16, two16 in *. lia. }
+    (* mk_header succeeds on (sp,dp,|rest|); use it to compute encoder wire *)
+    assert (Henc :
+              encode_udp_ipv4 defaults_ipv4 ipS ipD (src_port h) (dst_port h) rest
+              = Ok (udp_header_bytes
+                      {| src_port := src_port h;
+                         dst_port := dst_port h;
+                         length16 := to_word16 (8 + lenN rest);
+                         checksum := compute_udp_checksum_ipv4 ipS ipD h rest |}
+                    ++ rest)).
+    { unfold encode_udp_ipv4.
+      rewrite (mk_header_ok _ _ _ _
+                (eq_refl (Some {| src_port := to_word16 (src_port h);
+                                  dst_port := to_word16 (dst_port h);
+                                  length16 := to_word16 (8 + lenN rest);
+                                  checksum := 0 |}))).
+      all: clear; reflexivity || trivial. }
+    (* Simplify using [to_word16_id_if_lt] from [header_norm] and [Hck_eq]. *)
+    destruct Hnorm as [Hsp_lt [Hdp_lt [HL_lt _]]].
+    rewrite (to_word16_id_if_lt (src_port h) Hsp_lt) in Henc.
+    rewrite (to_word16_id_if_lt (dst_port h) Hdp_lt) in Henc.
+    rewrite (to_word16_id_if_lt (length16 h) HL_lt) in Henc at 1.
+    (* Replace the checksum by the canonicalized value: *)
+    rewrite Hck_eq in Henc.
+
+    (* Also replace [to_word16 (8 + lenN rest)] by [length16 h] via L = 8 + |rest|. *)
+    assert (HL_eq' : length16 h = 8 + lenN rest).
+    { (* same reasoning as above *)
+      subst Nbytes L.
+      rewrite parse_header_shape_bytes in EEq; [ |exact Hparse].
+      cbn in EEq. apply N.eqb_eq in EEq.
+      rewrite lenN_app, lenN_udp_header_bytes_8 in EEq. exact EEq. }
+    rewrite HL_eq' in Henc.
+
+    (* Finally, the encoder’s wire equals [udp_header_bytes h ++ rest]. *)
+    simpl in Henc. (* resolve the record update *)
+    (* But from parsing we know [w = udp_header_bytes h ++ rest]. *)
+    rewrite (parse_header_shape_bytes w h rest Hparse).
+    (* Return to (sp,dp,data) names: sp=src_port h, dp=dst_port h, data=rest from inversion. *)
+    exact Henc.
+  Qed.
+
+End UDP_Decode_Encode_Completeness.
