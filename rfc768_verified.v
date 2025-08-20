@@ -2320,25 +2320,31 @@ Proof.
  rewrite <- Hrest_eq; exact Hver.
 Qed.
 
-Theorem decode_encode_completeness_defaults_nonzero_ck :
-  forall ipS ipD w sp dp data h rest,
-    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+Lemma encode_setup_for_defaults_nonzero :
+  forall ipS ipD w h rest,
     parse_header w = Some (h, rest) ->
-    N.eqb (checksum h) 0 = false ->
-    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok w.
+    header_norm h ->
+    lenN w = length16 h ->
+    (* Conclusions about encoding setup *)
+    (8 + lenN rest <= mask16) /\
+    (length16 h = 8 + lenN rest) /\
+    (mk_header (src_port h) (dst_port h) (lenN rest) = 
+     Some {| src_port := to_word16 (src_port h);
+             dst_port := to_word16 (dst_port h);
+             length16 := to_word16 (8 + lenN rest);
+             checksum := 0 |}) /\
+    (encode_udp_ipv4 defaults_ipv4 ipS ipD (src_port h) (dst_port h) rest =
+     Ok (udp_header_bytes
+          {| src_port := src_port h;
+             dst_port := dst_port h;
+             length16 := length16 h;
+             checksum := compute_udp_checksum_ipv4 ipS ipD
+                         {| src_port := src_port h;
+                            dst_port := dst_port h;
+                            length16 := length16 h;
+                            checksum := 0 |} rest |} ++ rest)).
 Proof.
-  intros ipS ipD w sp dp data h rest Hdec Hparse Hck_nz.
-  
-  (* Apply the analysis lemma *)
-  pose proof (decode_defaults_nonzero_analysis ipS ipD w sp dp data h rest 
-              Hdec Hparse Hck_nz) as 
-              [Hnorm [Edp0 [Hlen_eq [HL_ge8 [Hdata_eq [Hsp_eq [Hdp_eq Hver]]]]]]].
-  
-  subst sp dp data.
-  
-  (* Canonicalize the checksum field *)
-  pose proof (verify_implies_checksum_equals_computed_nonzero_split
-                ipS ipD h rest Hnorm Hver Hck_nz) as Hck_eq.
+  intros ipS ipD w h rest Hparse Hnorm Hlen_eq.
   
   (* Build the encoder's header and show it coincides with [h]. *)
   assert (Hmk_ok : 8 + lenN rest <= mask16).
@@ -2349,6 +2355,12 @@ Proof.
       rewrite lenN_app, lenN_udp_header_bytes_8 in Hlen_eq. lia. }
     rewrite <- HL_eq. unfold mask16, two16 in *. lia. }
   
+  (* Replace [to_word16 (8 + lenN rest)] by [length16 h] *)
+  assert (HL_eq' : length16 h = 8 + lenN rest).
+  { pose proof (parse_header_shape_bytes w h rest Hparse) as Hw.
+    rewrite Hw in Hlen_eq.
+    rewrite lenN_app, lenN_udp_header_bytes_8 in Hlen_eq. lia. }
+  
   (* mk_header succeeds on (src_port h, dst_port h, |rest|) *)
   assert (Hmk : mk_header (src_port h) (dst_port h) (lenN rest) = 
                 Some {| src_port := to_word16 (src_port h);
@@ -2358,11 +2370,9 @@ Proof.
   { unfold mk_header. 
     apply N.leb_le in Hmk_ok. rewrite Hmk_ok. reflexivity. }
   
-  (* Replace [to_word16 (8 + lenN rest)] by [length16 h] *)
-  assert (HL_eq' : length16 h = 8 + lenN rest).
-  { pose proof (parse_header_shape_bytes w h rest Hparse) as Hw.
-    rewrite Hw in Hlen_eq.
-    rewrite lenN_app, lenN_udp_header_bytes_8 in Hlen_eq. lia. }
+  split; [exact Hmk_ok|].
+  split; [exact HL_eq'|].
+  split; [exact Hmk|].
   
   (* Show encode produces the expected wire *)
   unfold encode_udp_ipv4.
@@ -2390,10 +2400,280 @@ Proof.
     reflexivity. }
   
   rewrite Hh0_eq.
-  simpl.
-  
-  (* The encoded wire equals the original w *)
-  rewrite <- Hck_eq.
-  rewrite (parse_header_shape_bytes w h rest Hparse).
   reflexivity.
+Qed.
+
+Lemma checksum_invariant_with_zero :
+ forall ipS ipD h rest,
+   compute_udp_checksum_ipv4 ipS ipD h rest =
+   compute_udp_checksum_ipv4 ipS ipD 
+     {| src_port := src_port h;
+        dst_port := dst_port h;
+        length16 := length16 h;
+        checksum := 0 |} rest.
+Proof.
+ intros ipS ipD h rest.
+ Transparent compute_udp_checksum_ipv4.
+ unfold compute_udp_checksum_ipv4.
+ rewrite (checksum_words_ipv4_ck_invariant ipS ipD h rest 0).
+ reflexivity.
+ Opaque compute_udp_checksum_ipv4.
+Qed.
+
+Lemma encode_wire_equality_nonzero :
+ forall ipS ipD w h rest,
+   parse_header w = Some (h, rest) ->
+   header_norm h ->
+   verify_checksum_ipv4 ipS ipD h rest = true ->
+   N.eqb (checksum h) 0 = false ->
+   udp_header_bytes
+     {| src_port := src_port h;
+        dst_port := dst_port h;
+        length16 := length16 h;
+        checksum := compute_udp_checksum_ipv4 ipS ipD
+                     {| src_port := src_port h;
+                        dst_port := dst_port h;
+                        length16 := length16 h;
+                        checksum := 0 |} rest |} ++ rest = w.
+Proof.
+ intros ipS ipD w h rest Hparse Hnorm Hver Hck_nz.
+ 
+ (* Show the computed checksum equals h's checksum *)
+ assert (Hck_eq : checksum h = compute_udp_checksum_ipv4 ipS ipD h rest).
+ { apply verify_implies_checksum_equals_computed_nonzero_split; assumption. }
+ 
+ rewrite <- (checksum_invariant_with_zero ipS ipD h rest).
+ rewrite <- Hck_eq.
+ rewrite (parse_header_shape_bytes w h rest Hparse).
+ reflexivity.
+Qed.
+
+Theorem decode_encode_completeness_defaults_nonzero_ck :
+  forall ipS ipD w sp dp data h rest,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    parse_header w = Some (h, rest) ->
+    N.eqb (checksum h) 0 = false ->
+    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok w.
+Proof.
+  intros ipS ipD w sp dp data h rest Hdec Hparse Hck_nz.
+  
+  (* Apply the analysis lemma *)
+  pose proof (decode_defaults_nonzero_analysis ipS ipD w sp dp data h rest 
+              Hdec Hparse Hck_nz) as 
+              [Hnorm [Edp0 [Hlen_eq [HL_ge8 [Hdata_eq [Hsp_eq [Hdp_eq Hver]]]]]]].
+  
+  subst sp dp data.
+  
+  (* Apply the encoding setup lemma *)
+  pose proof (encode_setup_for_defaults_nonzero ipS ipD w h rest 
+              Hparse Hnorm Hlen_eq) as 
+              [Hmk_ok [HL_eq' [Hmk Henc_shape]]].
+  
+  rewrite Henc_shape.
+  f_equal.
+  apply encode_wire_equality_nonzero; assumption.
+Qed.
+
+Corollary decode_encode_exact_match_nonzero :
+  forall ipS ipD w sp dp data h rest,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    parse_header w = Some (h, rest) ->
+    N.eqb (checksum h) 0 = false ->
+    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok w.
+Proof.
+  intros ipS ipD w sp dp data h rest Hdec Hparse Hck_nz.
+  apply decode_encode_completeness_defaults_nonzero_ck with h rest; assumption.
+Qed.
+
+(** Canonicalized wire for defaults: same header fields, checksum replaced by the
+    computed (non-zero) UDP checksum over the pseudo-header, header-with-zero,
+    and data. *)
+Definition canonical_wire_defaults (ipS ipD:IPv4) (h:UdpHeader) (rest:list byte)
+  : list byte :=
+  udp_header_bytes
+    {| src_port := src_port h;
+       dst_port := dst_port h;
+       length16 := length16 h;
+       checksum := compute_udp_checksum_ipv4 ipS ipD h rest |}
+  ++ rest.
+
+(** Decoder-path analysis for the defaults when the transmitted checksum is zero.
+    This mirrors [decode_defaults_nonzero_analysis] but does not produce a
+    verifier fact (the defaults accept checksum=0 without verification). *)
+Lemma decode_defaults_zero_analysis :
+ forall ipS ipD w sp dp data h rest,
+   decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+   parse_header w = Some (h, rest) ->
+   N.eqb (checksum h) 0 = true ->
+   (* Conclusions *)
+   header_norm h /\
+   N.eqb (dst_port h) 0 = false /\
+   lenN w = length16 h /\
+   length16 h >= 8 /\
+   data = rest /\
+   sp = src_port h /\
+   dp = dst_port h.
+Proof.
+ intros ipS ipD w sp dp data h rest Hdec Hparse Hck0.
+ assert (Hnorm : header_norm h)
+   by (apply header_norm_of_parse_success with (w:=w) (rest:=rest); exact Hparse).
+ unfold decode_udp_ipv4 in Hdec. rewrite Hparse in Hdec.
+ assert (Epol : dst_port0_policy defaults_ipv4 = Reject) by reflexivity.
+ rewrite Epol in Hdec.
+ destruct (N.eqb (dst_port h) 0) eqn:Edp0; [discriminate|].
+ set (Nbytes := lenN w) in *.
+ set (L := length16 h) in *.
+ assert (Emode : length_rx_mode defaults_ipv4 = StrictEq) by reflexivity.
+ rewrite Emode in Hdec.
+ destruct (L <? 8) eqn:EL8; [discriminate|].
+ destruct (Nbytes <? L) eqn:ENbL; [discriminate|].
+ destruct (N.eqb Nbytes L) eqn:EEq; [|discriminate].
+ rewrite Hck0 in Hdec.                       (* zero-checksum branch *)
+ (* defaults: ValidOrZero + ZeroAlwaysAccept *)
+ change (checksum_rx_mode defaults_ipv4) with ValidOrZero in Hdec.
+ change (zero_checksum_allowed defaults_ipv4 ipD) with true in Hdec.
+ remember (take (N.to_nat (L - 8)) rest) as delivered.
+ inversion Hdec; subst sp dp data; clear Hdec.
+ assert (Hlen_eq : Nbytes = L) by (apply N.eqb_eq; exact EEq).
+ assert (Hrest_eq : delivered = rest).
+ { subst delivered Nbytes L.
+   replace (length16 h - 8) with (lenN rest).
+   2: { pose proof (parse_header_shape_bytes w h rest Hparse) as Hw.
+        rewrite Hw in Hlen_eq.
+        rewrite lenN_app, lenN_udp_header_bytes_8 in Hlen_eq. lia. }
+   rewrite N_to_nat_lenN, take_length_id; reflexivity. }
+ split; [exact Hnorm|].
+ split; [reflexivity|].
+ split; [exact Hlen_eq|].
+split. { apply N.ltb_ge in EL8. fold L in EL8. 
+          assert (length16 h >= 8) by (unfold L in EL8; lia).
+          assumption. }
+split; [exact Hrest_eq|].
+split; [reflexivity|reflexivity].
+Qed.
+
+(** Completeness for the zero-checksum case: re-encoding yields the canonicalized
+    wire that differs from the original only in the checksum field. *)
+Theorem decode_encode_completeness_defaults_zero_ck :
+  forall ipS ipD w sp dp data h rest,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    parse_header w = Some (h, rest) ->
+    N.eqb (checksum h) 0 = true ->
+    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data
+      = Ok (canonical_wire_defaults ipS ipD h rest).
+Proof.
+  intros ipS ipD w sp dp data h rest Hdec Hparse Hck0.
+  
+  (* Analyze the decode path and substitute [sp,dp,data]. *)
+  pose proof (decode_defaults_zero_analysis ipS ipD w sp dp data h rest
+                Hdec Hparse Hck0)
+    as [Hnorm [Edp0 [Hlen_eq [_ [Hdata_eq [Hsp_eq Hdp_eq]]]]]].
+  subst sp dp data.
+
+  (* Set up the encoder shape (mk_header success and WithChecksum branch). *)
+  pose proof (encode_setup_for_defaults_nonzero ipS ipD w h rest
+                Hparse Hnorm Hlen_eq)
+    as [Hmk_ok [_ [Hmk Hshape]]].
+
+  (* The encoder produces the canonical wire *)
+  unfold canonical_wire_defaults.
+  rewrite Hshape.
+  (* Both checksums are equal by the invariant lemma *)
+  rewrite <- (checksum_invariant_with_zero ipS ipD h rest).
+  reflexivity.
+Qed.
+
+Lemma canonical_wire_equals_original_nonzero :
+  forall ipS ipD w sp dp data h rest,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    parse_header w = Some (h, rest) ->
+    N.eqb (checksum h) 0 = false ->
+    canonical_wire_defaults ipS ipD h rest = w.
+Proof.
+  intros ipS ipD w sp dp data h rest Hdec Hparse Hcz.
+  pose proof (decode_defaults_nonzero_analysis ipS ipD w sp dp data h rest
+                Hdec Hparse Hcz)
+    as [Hnorm [_ [_ [_ [_ [_ [_ Hver]]]]]]].
+  unfold canonical_wire_defaults.
+  
+  (* The canonical wire has computed checksum, original has checksum h *)
+  assert (Hck_eq : checksum h = compute_udp_checksum_ipv4 ipS ipD h rest).
+  { apply verify_implies_checksum_equals_computed_nonzero_split; assumption. }
+  
+  (* Build the equality step by step *)
+  rewrite <- Hck_eq.
+  symmetry.
+  apply (parse_header_shape_bytes w h rest Hparse).
+Qed.
+
+(** Consolidated completeness (defaults, StrictEq).
+    Always returns the canonicalized wire; in the non-zero case, it is equal to
+    the original wire. *)
+Theorem decode_encode_completeness_defaults :
+  forall ipS ipD w sp dp data h rest,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    parse_header w = Some (h, rest) ->
+    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data
+      = Ok (canonical_wire_defaults ipS ipD h rest)
+    /\
+    (N.eqb (checksum h) 0 = false ->
+       canonical_wire_defaults ipS ipD h rest = w).
+Proof.
+  intros ipS ipD w sp dp data h rest Hdec Hparse.
+  destruct (N.eqb (checksum h) 0) eqn:Hcz.
+  - (* checksum = 0: produce canonicalized wire; equality to [w] not claimed *)
+    split.
+    + eapply decode_encode_completeness_defaults_zero_ck; eauto.
+    + intros Hcontra. discriminate.
+  - (* checksum ≠ 0: exact equality and canonicalization coincide *)
+    split.
+    + (* show encode returns Ok (canonical wire), via exact-equality to [w] *)
+      pose proof (decode_encode_completeness_defaults_nonzero_ck
+                    ipS ipD w sp dp data h rest Hdec Hparse Hcz) as Henc_eq.
+      rewrite Henc_eq.
+      f_equal.
+      symmetry.
+      apply canonical_wire_equals_original_nonzero with sp dp data; assumption.
+    + (* the promised equality canonical_wire = w *)
+      intros _.
+      apply canonical_wire_equals_original_nonzero with sp dp data; assumption.
+Qed.
+
+(** Corollary: The encoder always produces canonical wires, and these are
+    exactly the wires accepted by the decoder. *)
+Corollary udp_canonicalization :
+  forall ipS ipD w sp dp data,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    exists h rest,
+      parse_header w = Some (h, rest) /\
+      data = rest /\
+      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = 
+        Ok (canonical_wire_defaults ipS ipD h rest) /\
+      (N.eqb (checksum h) 0 = true \/ 
+       canonical_wire_defaults ipS ipD h rest = w).
+Proof.
+  intros ipS ipD w sp dp data Hdec.
+  (* Get the header from the successful decode *)
+  assert (Hdec_copy := Hdec).
+  unfold decode_udp_ipv4 in Hdec_copy.
+  destruct (parse_header w) as [[h rest]|] eqn:Hparse; [|discriminate Hdec_copy].
+  exists h, rest.
+  split; [exact Hparse|].
+  
+  (* Apply the completeness theorem *)
+  pose proof (decode_encode_completeness_defaults ipS ipD w sp dp data h rest 
+              Hdec Hparse) as [Henc Heq].
+  
+  (* Get data = rest from the decoder analysis *)
+  destruct (N.eqb (checksum h) 0) eqn:Hcz.
+  - pose proof (decode_defaults_zero_analysis ipS ipD w sp dp data h rest 
+                Hdec Hparse Hcz) as [_ [_ [_ [_ [Hdata _]]]]].
+    split; [exact Hdata|].
+    split; [exact Henc|].
+    left; exact Hcz.
+  - pose proof (decode_defaults_nonzero_analysis ipS ipD w sp dp data h rest 
+                Hdec Hparse Hcz) as [_ [_ [_ [_ [Hdata _]]]]].
+    split; [exact Hdata|].
+    split; [exact Henc|].
+    right; apply Heq; reflexivity.
 Qed.
