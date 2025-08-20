@@ -9,7 +9,10 @@ From Coq Require Import
   List
   NArith.NArith
   Lia
-  Bool.
+  Bool
+  Arith.
+  
+Require Import Coq.Init.Prelude.
 
 Import ListNotations.
 Open Scope N_scope.
@@ -33,7 +36,7 @@ Definition to_byte   (x:N) : byte   := x mod two8.
 Definition to_word16 (x:N) : word16 := x mod two16.
 
 Lemma to_word16_lt_two16 : forall x, to_word16 x < two16.
-Proof. intro x. unfold to_word16. apply N.mod_lt. exact two16_pos. Qed.
+Proof. intro x. unfold to_word16. apply N.mod_lt. unfold two16. lia. Qed.
 
 Lemma to_word16_id_if_lt : forall x, x < two16 -> to_word16 x = x.
 Proof. intros x Hx. unfold to_word16. apply N.mod_small. exact Hx. Qed.
@@ -41,18 +44,40 @@ Proof. intros x Hx. unfold to_word16. apply N.mod_small. exact Hx. Qed.
 Lemma to_word16_id_if_le_mask :
   forall x, x <= mask16 -> to_word16 x = x.
 Proof.
-  intros x Hx. apply to_word16_id_if_lt. unfold mask16 in Hx. lia.
+  intros x Hx. 
+  apply to_word16_id_if_lt. 
+  unfold mask16 in Hx.
+  assert (two16 = 65536) by reflexivity.
+  rewrite H. 
+  lia.
 Qed.
 
 (* List length in N *)
 Definition lenN {A} (xs:list A) : N := N.of_nat (List.length xs).
 Lemma lenN_app : forall (A:Type) (xs ys:list A), lenN (xs ++ ys) = lenN xs + lenN ys.
-Proof. intros A xs ys. unfold lenN. rewrite List.app_length, Nat2N.inj_add. reflexivity. Qed.
+Proof. intros A xs ys. unfold lenN. rewrite List.length_app, Nat2N.inj_add. reflexivity. Qed.
 Lemma lenN_cons : forall (A:Type) (x:A) xs, lenN (x::xs) = 1 + lenN xs.
-Proof. intros; unfold lenN; simpl; rewrite Nat2N.inj_succ; lia. Qed.
+Proof. 
+  intros A x xs. 
+  unfold lenN. 
+  simpl.
+  induction xs as [|y ys IH].
+  - reflexivity.
+  - simpl.
+    destruct (length ys) as [|n].
+    + reflexivity.
+    + simpl.
+      destruct n as [|n'].
+      * reflexivity.
+      * f_equal.
+        induction n' as [|n'' IH'].
+        ** reflexivity.
+        ** simpl. f_equal.
+           destruct (Pos.of_succ_nat n''); reflexivity.
+Qed.
 
 Lemma N_to_nat_lenN : forall (A:Type) (xs:list A), N.to_nat (lenN xs) = List.length xs.
-Proof. intros; unfold lenN; now rewrite N2Nat.id. Qed.
+Proof. intros; unfold lenN; apply Nat2N.id. Qed.
 
 (* take/drop (on nat) *)
 Fixpoint take {A} (n:nat) (xs:list A) : list A :=
@@ -81,7 +106,8 @@ Definition is_byte (b:byte) : bool := b <? two8.
 
 Lemma is_byte_true_of_mod : forall x, is_byte (x mod two8) = true.
 Proof.
-  intros x. unfold is_byte. apply N.ltb_lt. apply N.mod_lt. exact two8_pos.
+  intros x. unfold is_byte. apply N.ltb_lt. apply N.mod_lt. 
+  apply N.neq_0_lt_0. unfold two8. lia.
 Qed.
 
 (* ----------------------------------------------------------------------------
@@ -100,8 +126,13 @@ Definition word16_of_be (hi lo: byte) : word16 :=
 Lemma div256_lt256 :
   forall w, w < two16 -> (w / two8) < two8.
 Proof.
-  intros w Hw. apply N.div_lt_upper_bound; try exact two8_pos.
-  unfold two8, two16 in *. lia.
+  intros w Hw. 
+  unfold two8, two16 in *.
+  assert (w <= 65535) by lia.
+  assert (w / 256 <= 65535 / 256) by (apply N.div_le_mono; lia).
+  assert (65535 / 256 = 255) by reflexivity.
+  rewrite H1 in H0.
+  lia.
 Qed.
 
 Lemma word16_of_be_be16 :
@@ -111,8 +142,9 @@ Proof.
   intros w Hw. unfold be16_of_word16, word16_of_be.
   rewrite (N.mod_small (w / two8) two8).
   2:{ apply div256_lt256; exact Hw. }
-  rewrite <- (N.div_mod w two8) by (apply N.neq_0_lt_0; exact two8_pos).
-  lia.
+  assert (two8 <> 0) by (unfold two8; lia).
+  rewrite N.mul_comm.
+  rewrite <- N.div_mod; [reflexivity | exact H].
 Qed.
 
 (* Each byte produced by be16_of_word16 (after to_word16) is in range. *)
@@ -121,7 +153,8 @@ Lemma be16_of_word16_bytes_are_bytes_true :
             is_byte hi = true /\ is_byte lo = true.
 Proof.
   intros w. unfold be16_of_word16, is_byte.
-  simpl. split; apply N.ltb_lt; apply N.mod_lt; exact two8_pos.
+  simpl. split; apply N.ltb_lt; apply N.mod_lt; 
+  apply N.neq_0_lt_0; unfold two8; lia.
 Qed.
 
 (* Flatten list of 16-bit words into bytes *)
@@ -164,9 +197,21 @@ Definition mkIPv4 (x0 x1 x2 x3:byte) : IPv4 :=
 Definition normalizeIPv4 (ip:IPv4) : IPv4 :=
   mkIPv4 ip.(a0) ip.(a1) ip.(a2) ip.(a3).
 
+Lemma to_byte_idempotent : forall x, to_byte (to_byte x) = to_byte x.
+Proof.
+  intro x. unfold to_byte.
+  rewrite N.mod_mod.
+  - reflexivity.
+  - unfold two8. lia.
+Qed.
+
 Lemma normalizeIPv4_idempotent :
   forall ip, normalizeIPv4 (normalizeIPv4 ip) = normalizeIPv4 ip.
-Proof. intros [x0 x1 x2 x3]; reflexivity. Qed.
+Proof. 
+  intros [x0 x1 x2 x3].
+  unfold normalizeIPv4, mkIPv4. simpl.
+  f_equal; apply to_byte_idempotent.
+Qed.
 
 (* Two 16-bit words for a 32-bit IPv4 address, big-endian *)
 Definition ipv4_words (ip:IPv4) : list word16 :=
@@ -201,7 +246,10 @@ Proof.
   intros acc w Hacc Hw. unfold add16_ones.
   destruct (acc + w <? two16) eqn:E.
   - apply N.ltb_lt in E; exact E.
-  - apply N.ltb_ge in E. assert (acc + w < 2*two16) by nia. lia.
+  - apply N.ltb_ge in E. 
+    assert (acc + w < 2*two16).
+    { unfold two16 in *. lia. }
+    unfold mask16, two16 in *. lia.
 Qed.
 
 (* Fold over a list of 16-bit words with one's-complement addition. *)
@@ -213,29 +261,548 @@ Fixpoint sum16 (ws:list word16) : word16 :=
 
 Lemma sum16_lt_two16 : forall ws, sum16 ws < two16.
 Proof.
-  induction ws as [|w tl IH]; simpl; try lia.
-  apply add16_ones_bound; auto.
-  apply to_word16_lt_two16.
+  induction ws as [|w tl IH]; simpl.
+  - unfold two16. lia.
+  - apply add16_ones_bound; auto.
+    apply to_word16_lt_two16.
 Qed.
 
 (* One's-complement (bitwise not) within 16 bits. *)
 Definition complement16 (x:word16) : word16 := mask16 - x.
 Definition cksum16 (ws:list word16) : word16 := complement16 (sum16 ws).
 
+Lemma sum16_singleton : forall x,
+  sum16 [x] = add16_ones 0 (to_word16 x).
+Proof. reflexivity. Qed.
+
+Lemma add16_ones_comm : forall x y,
+  add16_ones x y = add16_ones y x.
+Proof.
+  intros x y.
+  unfold add16_ones.
+  rewrite N.add_comm.
+  reflexivity.
+Qed.
+
+(* Micro lemma 1: When no overflow, add16_ones is just addition *)
+Lemma add16_ones_no_overflow : forall x y,
+  x + y < two16 -> add16_ones x y = x + y.
+Proof.
+  intros x y H.
+  unfold add16_ones.
+  apply N.ltb_lt in H.
+  rewrite H.
+  reflexivity.
+Qed.
+
+(* Micro lemma 2: When overflow, add16_ones subtracts mask16 *)
+Lemma add16_ones_overflow : forall x y,
+  x + y >= two16 -> add16_ones x y = x + y - mask16.
+Proof.
+  intros x y H.
+  unfold add16_ones.
+  destruct (x + y <? two16) eqn:E.
+  - apply N.ltb_lt in E. lia.
+  - reflexivity.
+Qed.
+
+(* Micro lemma 3: Sum of two values less than two16 is less than 2*two16 *)
+Lemma sum_bound_double : forall x y,
+  x < two16 -> y < two16 -> x + y < 2 * two16.
+Proof.
+  intros x y Hx Hy.
+  unfold two16 in *.
+  lia.
+Qed.
+
+(* Micro lemma 4a: Commutativity for addition *)
+Lemma add_comm_3way : forall a b c : N,
+  a - b + c = c + (a - b).
+Proof.
+  intros. apply N.add_comm.
+Qed.
+
+(* Micro lemma 4a': When b <= a, c + (a - b) = (c + a) - b *)
+Lemma sub_add_assoc : forall a b c : N,
+  b <= a -> c + (a - b) = c + a - b.
+Proof.
+  intros a b c Hle.
+  (* c + (a - b) = c + a - b when b <= a *)
+  (* This follows from the fact that subtraction associates with addition from the right *)
+  rewrite <- N.add_sub_assoc.
+  - reflexivity.
+  - exact Hle.
+Qed.
+
+
+(* Micro lemma 4b1: 65536 > 65535 *)
+Lemma two16_gt_mask16 : two16 > mask16.
+Proof.
+  unfold two16, mask16.
+  compute. constructor.
+Qed.
+
+(* Micro lemma 4b2: if x >= two16 then x - mask16 >= 1 *)
+Lemma ge_two16_sub_mask16_ge_1 : forall x,
+  two16 <= x -> 1 <= x - mask16.
+Proof.
+  intros x H.
+  unfold two16, mask16 in *.
+  (* x >= 65536 and mask16 = 65535, so x - 65535 >= 65536 - 65535 = 1 *)
+  assert (65536 - 65535 <= x - 65535).
+  { apply N.sub_le_mono_r. exact H. }
+  assert (65536 - 65535 = 1) by reflexivity.
+  rewrite <- H1.
+  exact H0.
+Qed.
+
+(* Micro lemma 4b: y + z >= two16 implies mask16 <= y + z *)
+Lemma two16_implies_mask16_le : forall y z,
+  y + z >= two16 -> mask16 <= y + z.
+Proof.
+  intros y z H.
+  pose proof two16_gt_mask16 as Hgt.
+  unfold two16, mask16 in *.
+  (* If y + z >= 65536 and 65536 > 65535, then y + z > 65535, so 65535 <= y + z *)
+  clear - H Hgt.
+  lia.
+Qed.
+
+(* Micro lemma 4c: Rearranging addition *)
+Lemma add_rearrange : forall x y z : N,
+  x + (y + z) = x + y + z.
+Proof. intros. lia. Qed.
+
+(* Micro lemma 4: Arithmetic equality for overflow case *)
+Lemma overflow_arithmetic_eq : forall x y z,
+  x < two16 -> y < two16 -> z < two16 ->
+  y + z >= two16 ->
+  x + (y + z - mask16) = x + y + z - mask16.
+Proof.
+  intros x y z Hx Hy Hz Hyz.
+  pose proof (two16_implies_mask16_le y z Hyz) as Hle.
+  (* We want to show: x + (y + z - mask16) = x + y + z - mask16 *)
+  (* Using sub_add_assoc with a := y+z, b := mask16, c := x *)
+  (* We get: x + ((y+z) - mask16) = x + (y+z) - mask16 *)
+  rewrite sub_add_assoc by exact Hle.
+  (* Now we have: x + (y + z) - mask16 *)
+  (* We need: x + y + z - mask16 *)
+  rewrite <- add_rearrange.
+  reflexivity.
+Qed.
+
+(* Micro lemma 5: Associativity with parentheses *)
+Lemma add_assoc_N : forall x y z : N,
+  (x + y) + z = x + (y + z).
+Proof. intros. lia. Qed.
+
+(* Micro lemma 6: Case when y+z overflows but x+y doesn't *)
+Lemma add16_ones_assoc_case_yz_overflow : forall x y z,
+  x < two16 -> y < two16 -> z < two16 ->
+  x + y < two16 -> y + z >= two16 ->
+  x + y + z >= two16 -> x + (y + z - mask16) < two16 ->
+  (x + y) + z - mask16 = x + (y + z - mask16).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz Hsum Hxyz_mask.
+  (* Both sides equal x + y + z - mask16 *)
+  transitivity (x + y + z - mask16).
+  - (* (x + y) + z - mask16 = x + y + z - mask16 *)
+    lia.
+  - (* x + y + z - mask16 = x + (y + z - mask16) *)
+    symmetry. apply overflow_arithmetic_eq; assumption.
+Qed.
+
+(* Micro lemma 7: Conditional simplification when no overflow *)
+Lemma add16_ones_cond_no_overflow : forall a b,
+  a + b < two16 ->
+  (if a + b <? two16 then a + b else a + b - mask16) = a + b.
+Proof.
+  intros a b H.
+  apply N.ltb_lt in H. rewrite H. reflexivity.
+Qed.
+
+(* Micro lemma 8: Handle the specific conditional in case yz overflow *)
+Lemma add16_ones_assoc_yz_overflow_with_cond : forall x y z,
+  x < two16 -> y < two16 -> z < two16 ->
+  x + y < two16 -> y + z >= two16 ->
+  x + y + z >= two16 -> x + (y + z - mask16) < two16 ->
+  (x + y) + z - mask16 = 
+  (if x + (y + z - mask16) <? two16 
+   then x + (y + z - mask16)
+   else x + (y + z - mask16) - mask16).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz Hsum Hxyz_mask.
+  (* Since x + (y + z - mask16) < two16, the conditional chooses 'then' *)
+  rewrite add16_ones_cond_no_overflow by assumption.
+  (* Now apply the previous lemma *)
+  apply add16_ones_assoc_case_yz_overflow; assumption.
+Qed.
+
+(* Micro lemma 9: Both sides overflow case *)
+Lemma add16_ones_assoc_both_overflow : forall x y z,
+  x < two16 -> y < two16 -> z < two16 ->
+  x + y >= two16 -> y + z >= two16 ->
+  x + y + z >= two16 -> x + (y + z - mask16) >= two16 ->
+  (x + y - mask16) + z - mask16 = 
+  (x + (y + z - mask16) - mask16).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz Hsum Hxyz_mask.
+  (* Both sides have two subtractions *)
+  assert (H1: (x + y - mask16) + z - mask16 = x + y + z - mask16 - mask16) by lia.
+  assert (H2: x + (y + z - mask16) - mask16 = x + y + z - mask16 - mask16).
+  { (* Apply overflow_arithmetic_eq and then subtract mask16 again *)
+    assert (H2a: x + (y + z - mask16) = x + y + z - mask16).
+    { apply overflow_arithmetic_eq; assumption. }
+    rewrite H2a. reflexivity. }
+  rewrite H1. symmetry. exact H2.
+Qed.
+
+(* Micro lemma 10: Simple arithmetic for double subtraction *)
+Lemma double_sub_assoc : forall a b c d : N,
+  d <= a + b + c ->
+  (a + b) + c - d = a + b + c - d.
+Proof.
+  intros a b c d H. lia.
+Qed.
+
+Lemma add16_ones_overflow_bound : forall x y,
+  x < two16 -> y < two16 -> x + y >= two16 -> x + y - mask16 < two16.
+Proof.
+  intros x y Hx Hy Hsum.
+  pose proof (sum_bound_double x y Hx Hy) as Hdouble.
+  unfold two16, mask16 in *.
+  assert (x + y <= 131071) by lia.
+  assert (x + y - 65535 <= 65536) by lia.
+  (* Since x + y >= 65536, we have x + y - 65535 >= 1 *)
+  assert (x + y - 65535 >= 1) by lia.
+  assert (x + y <= 65535 + 65535) by lia.
+  assert (65535 + 65535 = 131070) by reflexivity.
+  assert (x + y <= 131070) by lia.
+  assert (x + y - 65535 <= 131070 - 65535) by lia.
+  assert (131070 - 65535 = 65535) by reflexivity.
+  assert (x + y - 65535 <= 65535) by lia.
+  (* Since x + y - 65535 <= 65535 < 65536, we have the result *)
+  assert (65535 < 65536) by reflexivity.
+  assert (x + y - 65535 < 65536) by lia.
+  exact H9.
+Qed.
+
+
+(* --- Small helpers with the right side conditions --- *)
+
+(* For any y,z with z < 2^16, the tail (y+z - mask16) is <= y. *)
+Lemma tail_le_y : forall y z,
+  z < two16 -> y + z - mask16 <= y.
+Proof.
+  intros y z Hz.
+  assert (Hz_le : z <= mask16) by (unfold mask16, two16 in *; lia).
+  (* Monotonicity of subtraction on the right: *)
+  assert (Hmono : y + z - mask16 <= y + mask16 - mask16).
+  { apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Hz_le. }
+  (* Reduce RHS to y and conclude *)
+  replace (y + mask16 - mask16) with y in Hmono by lia.
+  exact Hmono.
+Qed.
+
+
+(* 2) If x+y doesn't overflow, then x + (y+z - mask16) is also below 2^16. *)
+Lemma tail_lt_when_xy_no :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 -> x + y < two16 ->
+    x + (y + z - mask16) < two16.
+Proof.
+  intros x y z Hx Hy Hz Hxy.
+  pose proof (tail_le_y y z Hz) as Htail.
+  assert (Hxy_le : x + y <= mask16) by (unfold mask16, two16 in *; lia).
+  assert (Hsum_le : x + (y + z - mask16) <= x + y) by (apply N.add_le_mono_l; exact Htail).
+  unfold two16, mask16 in *; lia.
+Qed.
+
+(* 3) Rewrite x + (y+z - mask16) to x + y + z - mask16 when mask16 <= y+z. *)
+Lemma sub_add_rewrite_right :
+  forall x y z, mask16 <= y + z ->
+  x + (y + z - mask16) = x + y + z - mask16.
+Proof.
+  intros x y z Hyz.
+  (* Use your earlier lemma: sub_add_assoc : b <= a -> c + (a - b) = c + a - b *)
+  rewrite (sub_add_assoc (y + z) mask16 x Hyz). lia.
+Qed.
+
+(* 4) Symmetric rewrite on the left when mask16 <= x+y. *)
+Lemma sub_add_rewrite_left :
+  forall x y z, mask16 <= x + y ->
+  z + (x + y - mask16) = x + y + z - mask16.
+Proof.
+  intros x y z Hxy.
+  (* Use your lemma: c + (a - b) = c + a - b when b <= a *)
+  rewrite (sub_add_assoc (x + y) mask16 z Hxy).     (* z + (x+y) - mask16 *)
+  (* Commute ONLY the inner sum on the LHS; keep RHS unchanged *)
+  rewrite (N.add_comm z (x + y)).                   (* (x+y) + z - mask16 *)
+  reflexivity.                                      (* same as x+y+z - mask16 *)
+Qed.
+
+
+Lemma add16_ones_assoc_case_nn :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = true ->
+    (y + z <? two16) = true ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  apply N.ltb_lt in Hxy.
+  apply N.ltb_lt in Hyz.
+  rewrite (add16_ones_no_overflow x y Hxy).
+  rewrite (add16_ones_no_overflow y z Hyz).
+  unfold add16_ones at 1 2.
+  rewrite <- add_assoc_N.  (* x + (y + z)  ->  (x + y) + z *)
+  reflexivity.
+Qed.
+
+Lemma add16_ones_assoc_case_ny :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = true ->
+    (y + z <? two16) = false ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  apply N.ltb_lt in Hxy.
+  apply N.ltb_ge in Hyz.
+  (* Reorient the inequality with [lia] to match lemmas that expect [>=] *)
+  assert (Hyz_ge : y + z >= two16) by lia.
+
+  rewrite (add16_ones_no_overflow x y Hxy).
+  rewrite (add16_ones_overflow y z Hyz_ge).
+
+  (* (x+y)+z >= y+z >= 2^16 *)
+  assert (Hsum_ge : (x + y) + z >= two16) by lia.
+  rewrite (add16_ones_overflow (x + y) z Hsum_ge).
+
+  (* tail ≤ y and x+y < 2^16 ⇒ no overflow *)
+  rewrite (add16_ones_no_overflow x (y + z - mask16)
+            (tail_lt_when_xy_no x y z Hx Hy Hz Hxy)).
+
+  (* (x+y)+z - mask16 = x + (y+z - mask16) since y+z >= 2^16 *)
+  rewrite (sub_add_rewrite_right x y z (two16_implies_mask16_le _ _ Hyz_ge)).
+  reflexivity.
+Qed.
+
+(* Convenience orientation: accepts "two16 <= x+y" form *)
+Lemma add16_ones_overflow_le :
+  forall x y, two16 <= x + y -> add16_ones x y = x + y - mask16.
+Proof.
+  intros x y H.
+  apply add16_ones_overflow. lia.
+Qed.
+
+Lemma add16_ones_ext_by_sum :
+  forall a b c d,
+    a + b = c + d ->
+    add16_ones a b = add16_ones c d.
+Proof.
+  intros a b c d Heq.
+  unfold add16_ones.
+  now rewrite Heq.
+Qed.
+
+Lemma mask16_le_two16 : mask16 <= two16.
+Proof. cbv [mask16 two16]; lia. Qed.
+
+Lemma overflow_info :
+  forall x y, (x + y <? two16) = false ->
+  two16 <= x + y /\ mask16 <= x + y.
+Proof.
+  intros x y H.
+  apply N.ltb_ge in H. (* two16 <= x + y *)
+  split; [ exact H | eapply N.le_trans; [apply mask16_le_two16 | exact H] ].
+Qed.
+
+(* Align the outer sums when both inner pairs overflow (ltb=false premises). *)
+Lemma sums_align_both_overflow :
+  forall x y z,
+    (x + y <? two16) = false ->
+    (y + z <? two16) = false ->
+    (x + y - mask16) + z = x + (y + z - mask16).
+Proof.
+  intros x y z Hxy Hyz.
+  destruct (overflow_info x y Hxy) as [_ Hxy_mle].  (* mask16 <= x+y *)
+  destruct (overflow_info y z Hyz) as [_ Hyz_mle].  (* mask16 <= y+z *)
+  rewrite (N.add_comm (x + y - mask16) z).
+  rewrite (sub_add_rewrite_left  x y z Hxy_mle).
+  rewrite (sub_add_rewrite_right x y z Hyz_mle).
+  reflexivity.
+Qed.
+
+Lemma add16_ones_overflow_ltb_false :
+  forall x y,
+    (x + y <? two16) = false ->
+    add16_ones x y = x + y - mask16.
+Proof.
+  intros x y H.
+  apply N.ltb_ge in H.                (* two16 <= x + y *)
+  apply add16_ones_overflow; lia.     (* x + y >= two16 *)
+Qed.
+
+Lemma add16_ones_assoc_case_yy :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = false ->
+    (y + z <? two16) = false ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z _ _ _ Hxy Hyz.
+  rewrite (add16_ones_overflow_ltb_false x y Hxy).
+  rewrite (add16_ones_overflow_ltb_false y z Hyz).
+  apply add16_ones_ext_by_sum.
+  apply (sums_align_both_overflow x y z); assumption.
+Qed.
+
+Lemma add16_ones_no_overflow_ltb_true :
+  forall x y,
+    (x + y <? two16) = true ->
+    add16_ones x y = x + y.
+Proof.
+  intros x y H.
+  apply N.ltb_lt in H.
+  apply add16_ones_no_overflow; exact H.
+Qed.
+
+
+(* If t ≤ mask16, then x + t - mask16 is strictly below 2^16 whenever x is. *)
+Lemma add_minus_mask16_lt_two16 :
+  forall x t, x < two16 -> t <= mask16 -> x + t - mask16 < two16.
+Proof.
+  intros x t Hx Ht.
+  assert (Hle : x + t - mask16 <= x + mask16 - mask16).
+  { apply N.sub_le_mono_r. apply N.add_le_mono_l. exact Ht. }
+  replace (x + mask16 - mask16) with x in Hle by lia.
+  eapply N.le_lt_trans; [exact Hle| exact Hx].
+Qed.
+
+
+Lemma add16_ones_assoc_case_yn :
+  forall x y z,
+    x < two16 -> y < two16 -> z < two16 ->
+    (x + y <? two16) = false ->
+    (y + z <? two16) = true ->
+    add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz Hxy Hyz.
+  (* Reduce the two inner sums by their tests *)
+  rewrite (add16_ones_overflow_ltb_false x y Hxy).
+  rewrite (add16_ones_no_overflow_ltb_true y z Hyz).
+
+  (* From overflow on x+y, get mask16 <= x+y *)
+  destruct (overflow_info x y Hxy) as [Hxy_ge Hxy_mle].
+
+  (* From no-overflow on y+z, get y+z <= mask16 *)
+  apply N.ltb_lt in Hyz.
+  assert (Hyz_le : y + z <= mask16).
+  { unfold mask16, two16. 
+    assert (y + z <= 65535).
+    { assert (y + z < 65536) by exact Hyz. lia. }
+    exact H. }
+
+  (* LHS outer is no-overflow: ((x+y)-mask16)+z < 2^16 *)
+  assert (Hout_lt : (x + y - mask16) + z < two16).
+  { rewrite N.add_comm.
+    rewrite (sub_add_rewrite_left x y z Hxy_mle).
+    replace (x + y + z - mask16) with (x + (y + z) - mask16) by lia.
+    assert (Htail_le_x : x + (y + z) - mask16 <= x).
+    { assert (x + (y + z) <= x + mask16).
+      { apply N.add_le_mono_l. exact Hyz_le. }
+      lia. }
+    eapply N.le_lt_trans; [exact Htail_le_x | exact Hx]. }
+  rewrite (add16_ones_no_overflow (x + y - mask16) z Hout_lt).
+
+  (* RHS outer overflows: x + (y+z) >= x + y >= 2^16 *)
+  assert (Hrhs_ge : x + (y + z) >= two16) by lia.
+  rewrite (add16_ones_overflow x (y + z) Hrhs_ge).
+
+  (* Align arithmetic on both sides *)
+  rewrite N.add_comm with (n := x + y - mask16) (m := z).
+  rewrite (sub_add_rewrite_left x y z Hxy_mle).
+  replace (x + y + z - mask16) with (x + (y + z) - mask16) by lia.
+  reflexivity.
+Qed.
+
+Lemma add16_ones_assoc : forall x y z,
+  x < two16 -> y < two16 -> z < two16 ->
+  add16_ones (add16_ones x y) z = add16_ones x (add16_ones y z).
+Proof.
+  intros x y z Hx Hy Hz.
+  destruct (x + y <? two16) eqn:Exy.
+  - destruct (y + z <? two16) eqn:Eyz.
+    + apply add16_ones_assoc_case_nn; auto.
+    + apply add16_ones_assoc_case_ny; auto.
+  - destruct (y + z <? two16) eqn:Eyz.
+    + apply add16_ones_assoc_case_yn; auto.
+    + apply add16_ones_assoc_case_yy; auto.
+Qed.
+
+Lemma sum16_app_single : forall xs y,
+  sum16 (xs ++ [y]) = add16_ones (sum16 xs) (to_word16 y).
+Proof.
+  induction xs as [|x xs IH]; intro y.
+  - reflexivity.
+  - simpl.
+    rewrite IH.
+    rewrite <- add16_ones_comm with (x := to_word16 x) (y := add16_ones (sum16 xs) (to_word16 y)).
+    rewrite <- add16_ones_assoc.
+    + rewrite add16_ones_comm with (x := to_word16 x) (y := sum16 xs).
+      reflexivity.
+    + apply to_word16_lt_two16.
+    + apply sum16_lt_two16.
+    + apply to_word16_lt_two16.
+Qed.
+
 Lemma sum16_app : forall xs ys,
   sum16 (xs ++ ys) = fold_left add16_ones (map to_word16 ys) (sum16 xs).
 Proof.
-  induction xs as [|x xs IH]; intros ys; simpl; auto.
-  now rewrite IH.
+  intros xs ys. 
+  destruct ys as [|y ys'].
+  - rewrite app_nil_r. reflexivity.
+  - destruct ys' as [|y' ys''].
+    + simpl. rewrite sum16_app_single. reflexivity.
+    + simpl. 
+      assert (sum16 ((xs ++ [y]) ++ y' :: ys'') = 
+              fold_left add16_ones (map to_word16 (y' :: ys'')) (sum16 (xs ++ [y]))).
+      { clear. 
+        generalize (xs ++ [y]) as zs.
+        intro zs.
+        generalize (y' :: ys'') as ws.
+        intro ws.
+        clear xs y y' ys''.
+        revert zs.
+        induction ws as [|w ws' IH]; intro zs; simpl.
+        - rewrite app_nil_r. reflexivity.
+        - assert (sum16 (zs ++ w :: ws') = sum16 ((zs ++ [w]) ++ ws')).
+          { rewrite <- app_assoc. simpl. reflexivity. }
+          rewrite H. clear H.
+          rewrite IH.
+          simpl.
+          rewrite sum16_app_single.
+          reflexivity.
+      }
+      rewrite <- app_assoc in H. simpl in H.
+      rewrite H.
+      rewrite sum16_app_single.
+      reflexivity.
 Qed.
 
 Lemma add16_ones_complement :
   forall s, s < two16 -> add16_ones s (complement16 s) = mask16.
 Proof.
   intros s Hs. unfold add16_ones, complement16.
-  replace (s + (mask16 - s)) with mask16 by lia.
-  rewrite N.ltb_lt; [reflexivity|].
-  unfold mask16, two16 in *; lia.
+  assert (s + (mask16 - s) = mask16).
+  { unfold mask16. lia. }
+  rewrite H.
+  assert (mask16 < two16).
+  { unfold mask16, two16. lia. }
+  apply N.ltb_lt in H0.
+  rewrite H0.
+  reflexivity.
 Qed.
 
 Lemma sum16_with_cksum_is_allones :
@@ -246,9 +813,14 @@ Proof.
   set (s := sum16 ws).
   unfold cksum16, complement16.
   simpl.
-  rewrite (to_word16_id_if_le_mask (mask16 - s)).
-  - apply add16_ones_complement. apply sum16_lt_two16.
-  - unfold mask16, two16. lia.
+  assert (mask16 - s <= mask16).
+  { assert (s <= mask16).
+    { pose proof (sum16_lt_two16 ws).
+      unfold mask16, two16 in *. lia. }
+    lia. }
+  change (add16_ones s (to_word16 (mask16 - s)) = mask16).
+  rewrite (to_word16_id_if_le_mask (mask16 - s) H).
+  apply add16_ones_complement. apply sum16_lt_two16.
 Qed.
 
 (* ----------------------------------------------------------------------------
@@ -343,7 +915,9 @@ Lemma compute_udp_checksum_ipv4_nonzero :
 Proof.
   intros ipS ipD h data.
   unfold compute_udp_checksum_ipv4.
-  destruct (N.eqb (cksum16 (checksum_words_ipv4 ipS ipD h data)) 0) eqn:E; cbn; lia.
+  destruct (N.eqb (cksum16 (checksum_words_ipv4 ipS ipD h data)) 0) eqn:E; simpl.
+  - unfold mask16. intro H. discriminate.
+  - apply N.eqb_neq in E. intro H. exact (E H).
 Qed.
 
 (* Helper: zero-checksum acceptance per cfg and destination address *)
@@ -390,22 +964,22 @@ Definition Err {A E} (e:E) : result A E := inr e.
 
 Definition encode_udp_ipv4
   (cfg:Config) (src_ip dst_ip:IPv4)
-  (src_port dst_port:word16) (data:list byte)
+  (sp dp:word16) (data:list byte)
   : result (list byte) EncodeError :=
-  match mk_header src_port dst_port (lenN data) with
+  match mk_header sp dp (lenN data) with
   | None => Err Oversize
   | Some h0 =>
       let h1 :=
         match cfg.(checksum_tx_mode) with
-        | NoChecksum => {| src_port := h0.(src_port)
-                         ; dst_port := h0.(dst_port)
-                         ; length16 := h0.(length16)
+        | NoChecksum => {| src_port := src_port h0
+                         ; dst_port := dst_port h0
+                         ; length16 := length16 h0
                          ; checksum := 0 |}
         | WithChecksum =>
             let c := compute_udp_checksum_ipv4 src_ip dst_ip h0 data in
-            {| src_port := h0.(src_port)
-             ; dst_port := h0.(dst_port)
-             ; length16 := h0.(length16)
+            {| src_port := src_port h0
+             ; dst_port := dst_port h0
+             ; length16 := length16 h0
              ; checksum := c |}
         end in
       Ok (udp_header_bytes h1 ++ data)
@@ -565,13 +1139,13 @@ Definition udp_rx_icmp_advice
   (decode_result: result UdpDeliver DecodeError)
   : RxAdvice :=
   match decode_result with
-  | Ok d =>
+  | inl d =>
       if has_listener d.(dst_ip_out) d.(dst_port_out)
       then NoAdvice
       else SendICMPDestUnreach ICMP_PORT_UNREACH
-  | Err BadLength => NoAdvice            (* UDP length errors: drop; no ICMP *)
-  | Err BadChecksum => NoAdvice          (* Checksum errors: drop; no ICMP *)
-  | Err DstPortZeroNotAllowed => NoAdvice
+  | inr BadLength => NoAdvice            (* UDP length errors: drop; no ICMP *)
+  | inr BadChecksum => NoAdvice          (* Checksum errors: drop; no ICMP *)
+  | inr DstPortZeroNotAllowed => NoAdvice
   end.
 
 (* Determine if ICMP should be sent based on destination type. *)
@@ -637,22 +1211,56 @@ Definition header_norm (h:UdpHeader) : Prop :=
   /\ checksum h < two16.
 
 Lemma header_norm_encode_h1 :
-  forall h0 ipS ipD data,
+  forall sp dp len h0 ipS ipD data,
+    mk_header sp dp len = Some h0 ->
     header_norm {| src_port := src_port h0;
                    dst_port := dst_port h0;
                    length16 := length16 h0;
                    checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}.
 Proof.
-  intros h0 ipS ipD data. unfold header_norm; repeat split.
-  all: try apply to_word16_lt_two16.
-  - apply to_word16_lt_two16.
+  intros sp dp len h0 ipS ipD data Hmk.
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp [Hlen _]]]].
+  unfold header_norm; simpl. 
+  rewrite Hsp, Hdp, Hlen.
+  repeat split; try apply to_word16_lt_two16.
   - unfold compute_udp_checksum_ipv4.
     set (x := cksum16 (checksum_words_ipv4 ipS ipD h0 data)).
     destruct (N.eqb x 0).
-    + unfold mask16, two16; lia.
+    + unfold mask16, two16. reflexivity.
     + unfold cksum16, complement16.
       pose proof (sum16_lt_two16 (checksum_words_ipv4 ipS ipD h0 data)) as Hs.
-      unfold mask16, two16 in *. lia.
+      unfold x. clear x.
+      unfold mask16, two16.
+      assert (65535 - sum16 (checksum_words_ipv4 ipS ipD h0 data) < 65536).
+      { assert (sum16 (checksum_words_ipv4 ipS ipD h0 data) < 65536) by exact Hs.
+        assert (sum16 (checksum_words_ipv4 ipS ipD h0 data) <= 65535) by lia.
+        lia. }
+      exact H.
+Qed.
+
+Lemma is_byte_8_andb_true :
+  forall b0 b1 b2 b3 b4 b5 b6 b7,
+    is_byte b0 = true -> is_byte b1 = true ->
+    is_byte b2 = true -> is_byte b3 = true ->
+    is_byte b4 = true -> is_byte b5 = true ->
+    is_byte b6 = true -> is_byte b7 = true ->
+    is_byte b0 && is_byte b1 && is_byte b2 && is_byte b3 &&
+    is_byte b4 && is_byte b5 && is_byte b6 && is_byte b7 && true = true.
+Proof.
+  intros.
+  rewrite H, H0, H1, H2, H3, H4, H5, H6.
+  reflexivity.
+Qed.
+
+Lemma word16_of_be_reconstruct :
+  forall w,
+    w < two16 ->
+    word16_of_be ((w / two8) mod two8) (w mod two8) = w.
+Proof.
+  intros w Hw.
+  generalize (word16_of_be_be16 w Hw).
+  unfold be16_of_word16.
+  simpl. intros H. exact H.
 Qed.
 
 Lemma parse_header_bytes_of_header_norm :
@@ -660,63 +1268,135 @@ Lemma parse_header_bytes_of_header_norm :
     header_norm h ->
     parse_header (udp_header_bytes h ++ rest) = Some (h, rest).
 Proof.
-  intros h rest Hn.
-  unfold udp_header_bytes, udp_header_words. simpl.
-  remember (be16_of_word16 (to_word16 (src_port h))) as p0 eqn:Hp0.
-  destruct p0 as [s0 s1].
-  remember (be16_of_word16 (to_word16 (dst_port h))) as p1 eqn:Hp1.
-  destruct p1 as [d0 d1].
-  remember (be16_of_word16 (to_word16 (length16 h))) as p2 eqn:Hp2.
-  destruct p2 as [l0 l1].
-  remember (be16_of_word16 (to_word16 (checksum h))) as p3 eqn:Hp3.
-  destruct p3 as [c0 c1].
-  cbn.
-  unfold parse_header; cbn.
-  (* Header byte-range check succeeds *)
-  pose proof (be16_of_word16_bytes_are_bytes_true (src_port h)) as [Hsp0 Hsp1].
-  rewrite Hp0 in Hsp0, Hsp1; cbn in Hsp0, Hsp1.
-  pose proof (be16_of_word16_bytes_are_bytes_true (dst_port h)) as [Hdp0 Hdp1].
-  rewrite Hp1 in Hdp0, Hdp1; cbn in Hdp0, Hdp1.
-  pose proof (be16_of_word16_bytes_are_bytes_true (length16 h)) as [Hl0 Hl1].
-  rewrite Hp2 in Hl0, Hl1; cbn in Hl0, Hl1.
-  pose proof (be16_of_word16_bytes_are_bytes_true (checksum h)) as [Hc0 Hc1].
-  rewrite Hp3 in Hc0, Hc1; cbn in Hc0, Hc1.
+  intros h rest [Hsp [Hdp [HL Hck]]].
+  unfold udp_header_bytes, udp_header_words, parse_header.
   simpl.
-  rewrite Hsp0; simpl. rewrite Hsp1; simpl.
-  rewrite Hdp0; simpl. rewrite Hdp1; simpl.
-  rewrite Hl0;  simpl. rewrite Hl1;  simpl.
-  rewrite Hc0;  simpl. rewrite Hc1;  simpl.
-  (* Now the parse succeeds; show fields reconstruct h *)
-  f_equal.
-  - apply f_equal2; [|].
-    + apply f_equal2.
-      * destruct Hn as [Hsp [Hdp [HL Hck]]].
-        rewrite (to_word16_id_if_lt (src_port h) Hsp).
-        rewrite <- Hp0.
-        rewrite (word16_of_be_be16 (to_word16 (src_port h))).
-        { rewrite to_word16_id_if_lt by apply to_word16_lt_two16. reflexivity. }
-        apply to_word16_lt_two16.
-      * destruct Hn as [_ [Hdp [HL Hck]]].
-        rewrite (to_word16_id_if_lt (dst_port h) Hdp).
-        rewrite <- Hp1.
-        rewrite (word16_of_be_be16 (to_word16 (dst_port h))).
-        { rewrite to_word16_id_if_lt by apply to_word16_lt_two16. reflexivity. }
-        apply to_word16_lt_two16.
-    + apply f_equal2.
-      * destruct Hn as [_ [_ [HL Hck]]].
-        rewrite (to_word16_id_if_lt (length16 h) HL).
-        rewrite <- Hp2.
-        rewrite (word16_of_be_be16 (to_word16 (length16 h))).
-        { rewrite to_word16_id_if_lt by apply to_word16_lt_two16. reflexivity. }
-        apply to_word16_lt_two16.
-      * destruct Hn as [_ [_ [_ Hck]]].
-        rewrite (to_word16_id_if_lt (checksum h) Hck).
-        rewrite <- Hp3.
-        rewrite (word16_of_be_be16 (to_word16 (checksum h))).
-        { rewrite to_word16_id_if_lt by apply to_word16_lt_two16. reflexivity. }
-        apply to_word16_lt_two16.
-  - reflexivity.
+  repeat rewrite is_byte_true_of_mod.
+  simpl.
+  repeat rewrite word16_of_be_be16.
+  repeat rewrite to_word16_id_if_lt by assumption.
+  f_equal. destruct h. simpl. reflexivity.
+  all: apply to_word16_lt_two16.
 Qed.
+
+(* === Helper 1: checksum material ignores the checksum field ================= *)
+
+Lemma checksum_words_ipv4_ck_invariant :
+  forall ipS ipD h data ck,
+    checksum_words_ipv4 ipS ipD
+      {| src_port := src_port h
+       ; dst_port := dst_port h
+       ; length16 := length16 h
+       ; checksum := ck |} data
+    = checksum_words_ipv4 ipS ipD h data.
+Proof.
+  intros. cbn [checksum_words_ipv4 udp_header_words_zero_ck]. reflexivity.
+Qed.
+
+(* === Helper 2: cksum16 ws = 0  ⇒  sum16 ws = 0xFFFF ======================== *)
+
+Lemma cksum16_zero_sum_allones :
+  forall ws, cksum16 ws = 0 -> sum16 ws = mask16.
+Proof.
+  intros ws H0.
+  unfold cksum16, complement16 in H0.
+  assert (Hlt : sum16 ws < two16) by apply sum16_lt_two16.
+  assert (Hle : sum16 ws <= mask16) by (unfold mask16, two16 in *; lia).
+  lia.
+Qed.
+
+(* === Helper 3: canonicalization for 0xFFFF ================================= *)
+
+Lemma to_word16_mask16_id : to_word16 mask16 = mask16.
+Proof. apply to_word16_id_if_le_mask; unfold mask16; lia. Qed.
+
+(* === Helper 4: if sum16 ws = 0xFFFF then appending 0xFFFF keeps it all-ones == *)
+
+Lemma sum16_app_mask16_of_allones :
+  forall ws, sum16 ws = mask16 -> sum16 (ws ++ [mask16]) = mask16.
+Proof.
+  intros ws Hs.
+  rewrite sum16_app_single, to_word16_mask16_id, Hs.
+  rewrite add16_ones_overflow by (unfold mask16, two16; lia).
+  reflexivity.
+Qed.
+
+Lemma tail_if_cksum_zero :
+  forall ws, (cksum16 ws =? 0) = true ->
+    ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws] = ws ++ [mask16].
+Proof. intros ws Ez. now rewrite Ez. Qed.
+
+Lemma sum16_app_if_cksum_zero :
+  forall ws, (cksum16 ws =? 0) = true ->
+    sum16 (ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws]) = mask16.
+Proof.
+  intros ws Ez.
+  rewrite (tail_if_cksum_zero ws Ez).
+  apply sum16_app_mask16_of_allones.
+  apply cksum16_zero_sum_allones. now apply N.eqb_eq in Ez.
+Qed.
+
+Lemma sum16_app_if_cksum_nonzero :
+  forall ws, (cksum16 ws =? 0) = false ->
+    sum16 (ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws]) = mask16.
+Proof.
+  intros ws Ez. rewrite Ez. simpl.
+  change (sum16 (ws ++ [cksum16 ws]) = mask16).
+  apply sum16_with_cksum_is_allones.
+Qed.
+
+Lemma sum16_app_if_cksum_zero_words :
+  forall ws ws', ws' = ws -> (cksum16 ws =? 0) = true ->
+    sum16 (ws ++ [if cksum16 ws' =? 0 then mask16 else cksum16 ws']) = mask16.
+Proof.
+  intros ws ws' Heq Hz. subst ws'. apply sum16_app_if_cksum_zero; assumption.
+Qed.
+
+Lemma sum16_app_if_cksum_zero_concrete :
+  forall ipS ipD h0 data,
+    (cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0) = true ->
+    sum16 (checksum_words_ipv4 ipS ipD h0 data ++
+           [if cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0
+            then mask16 else cksum16 (checksum_words_ipv4 ipS ipD h0 data)]) = mask16.
+Proof.
+  intros ipS ipD h0 data Ez.
+  set (ws := checksum_words_ipv4 ipS ipD h0 data).
+  rewrite (tail_if_cksum_zero ws Ez).
+  apply sum16_app_mask16_of_allones.
+  apply cksum16_zero_sum_allones. now apply N.eqb_eq in Ez.
+Qed.
+
+Lemma tail_if_cksum_nonzero :
+  forall ws, (cksum16 ws =? 0) = false ->
+    ws ++ [if cksum16 ws =? 0 then mask16 else cksum16 ws] = ws ++ [cksum16 ws].
+Proof.
+  intros ws Ez. rewrite Ez; reflexivity.
+Qed.
+
+Lemma sum16_app_if_cksum_nonzero_concrete :
+  forall ipS ipD h0 data,
+    (cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0) = false ->
+    sum16 (checksum_words_ipv4 ipS ipD h0 data ++
+           [if cksum16 (checksum_words_ipv4 ipS ipD h0 data) =? 0
+            then mask16 else cksum16 (checksum_words_ipv4 ipS ipD h0 data)]) = mask16.
+Proof.
+  intros ipS ipD h0 data Ez.
+  set (ws := checksum_words_ipv4 ipS ipD h0 data).
+  rewrite (tail_if_cksum_nonzero ws Ez).
+  change (sum16 (ws ++ [cksum16 ws]) = mask16).
+  apply sum16_with_cksum_is_allones.
+Qed.
+
+Lemma sum16_app_if_cksum_nonzero_words :
+  forall ws ws', ws' = ws ->
+    (cksum16 ws =? 0) = false ->
+    sum16 (ws ++ [if cksum16 ws' =? 0 then mask16 else cksum16 ws']) = mask16.
+Proof.
+  intros ws ws' Heq Hz. subst ws'. apply sum16_app_if_cksum_nonzero; exact Hz.
+Qed.
+
+
+(* === Main lemma (short, uses the helpers) ================================== *)
 
 Lemma verify_checksum_ipv4_encode_ok :
   forall ipS ipD sp dp data h0 h1,
@@ -728,22 +1408,34 @@ Lemma verify_checksum_ipv4_encode_ok :
     verify_checksum_ipv4 ipS ipD h1 data = true.
 Proof.
   intros ipS ipD sp dp data h0 h1 Hmk ->.
-  unfold verify_checksum_ipv4, compute_udp_checksum_ipv4.
+  (* Only unfold the verifier; keep compute_udp folded so the invariant matches. *)
+  unfold verify_checksum_ipv4.
+
+  (* Replace the checksum material built from [h1] by the one from [h0]. *)
+  rewrite (checksum_words_ipv4_ck_invariant ipS ipD h0 data
+            (compute_udp_checksum_ipv4 ipS ipD h0 data)).
+
+  (* The appended singleton is just the header's checksum field. *)
+  cbn [checksum].
+
+  (* Freeze the words; only now unfold compute_udp. *)
   set (words := checksum_words_ipv4 ipS ipD h0 data).
-  remember (cksum16 words) as c.
-  destruct (N.eqb c 0) eqn:Ez.
-  - apply N.eqb_eq. simpl.
-    assert (Hs: sum16 words = mask16).
-    { apply N.eqb_eq in Ez. subst c.
-      unfold cksum16 in Heqc. subst.
-      unfold complement16.
-      assert (Hlt: sum16 words < two16) by apply sum16_lt_two16.
-      assert (Hle: sum16 words <= mask16) by (unfold mask16, two16 in *; lia).
-      lia. }
-    rewrite <- Hs. rewrite sum16_app. simpl.
-    unfold add16_ones. rewrite N.ltb_ge; [|lia]. lia.
-  - apply N.eqb_eq. simpl. rewrite <- Heqc.
-    apply sum16_with_cksum_is_allones.
+  unfold compute_udp_checksum_ipv4.
+
+(* Split on whether the computed checksum would be zero. *)
+destruct (N.eqb (cksum16 words) 0) eqn:Ez.  (* NOTE: no [simpl] here *)
+
+(* zero branch *)
+apply N.eqb_eq.
+subst words.
+apply sum16_app_if_cksum_zero_concrete.
+exact Ez.
+
+(* nonzero branch *)
+apply N.eqb_eq.
+eapply sum16_app_if_cksum_nonzero_words.
+- reflexivity.
+- exact Ez.
 Qed.
 
 Lemma lenN_udp_header_bytes_8 :
@@ -768,407 +1460,396 @@ Proof.
   nia.
 Qed.
 
-(* MAIN Theorem A (StrictEq):
-   Defaults (Reject destination-port 0). Premise: to_word16 dp ≠ 0. *)
-Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 :
-  forall ipS ipD sp dp data wire h0,
-    to_word16 dp <> 0%N ->
+Lemma Ok_inj {A E} (x y : A) : @Ok A E x = Ok y -> x = y.
+Proof. now inversion 1. Qed.
+
+Lemma lenN_wire_from_header_bytes :
+  forall h data, lenN (udp_header_bytes h ++ data) = 8 + lenN data.
+Proof.
+  intros h data.
+  rewrite lenN_app, lenN_udp_header_bytes_8. lia.
+Qed.
+
+Lemma length16_h1_total_len :
+  forall ipS ipD sp dp data h0 h1,
+    mk_header sp dp (lenN data) = Some h0 ->
+    h1 = {| src_port := src_port h0
+          ; dst_port := dst_port h0
+          ; length16 := length16 h0
+          ; checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |} ->
+    length16 h1 = 8 + lenN data.
+Proof.
+  intros ipS ipD sp dp data h0 h1 Hmk ->.
+  simpl.
+  destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL _]]]].
+  rewrite HL. now apply to_word16_id_if_le_mask.
+Qed.
+
+Lemma checksum_h1_eqb_zero_false :
+  forall ipS ipD sp dp data h0 h1,
+    mk_header sp dp (lenN data) = Some h0 ->
+    h1 = {| src_port := src_port h0
+          ; dst_port := dst_port h0
+          ; length16 := length16 h0
+          ; checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |} ->
+    N.eqb (checksum h1) 0 = false.
+Proof.
+  intros ipS ipD sp dp data h0 h1 Hmk ->. simpl.
+  apply N.eqb_neq.
+  apply compute_udp_checksum_ipv4_nonzero.
+Qed.
+
+Lemma h1_ports_eq :
+  forall ipS ipD sp dp data h0 h1,
+    mk_header sp dp (lenN data) = Some h0 ->
+    h1 = {| src_port := src_port h0
+          ; dst_port := dst_port h0
+          ; length16 := length16 h0
+          ; checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |} ->
+    src_port h1 = to_word16 sp /\ dst_port h1 = to_word16 dp.
+Proof.
+  intros ipS ipD sp dp data h0 h1 Hmk ->. simpl.
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]].
+  now rewrite Hsp, Hdp.
+Qed.
+
+Lemma take_lenN_id :
+  forall (A:Type) (xs:list A),
+    take (N.to_nat (lenN xs)) xs = xs.
+Proof.
+  intros A xs. rewrite N_to_nat_lenN. apply take_length_id.
+Qed.
+
+Lemma encode_udp_defaults_wire_eq_fast :
+  forall ipS ipD sp dp data h0 h1 wire,
+    mk_header sp dp (lenN data) = Some h0 ->
+    h1 = {| src_port := src_port h0
+          ; dst_port := dst_port h0
+          ; length16 := length16 h0
+          ; checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |} ->
+    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
+    wire = udp_header_bytes h1 ++ data.
+Proof.
+  intros ipS ipD sp dp data h0 h1 wire Hmk -> Henc.
+  unfold encode_udp_ipv4 in Henc. rewrite Hmk in Henc.
+  change (checksum_tx_mode defaults_ipv4) with WithChecksum in Henc.
+  apply Ok_inj in Henc. symmetry; exact Henc.
+Qed.
+
+Lemma N_add_sub_cancel_l : forall a b : N, a + b - a = b.
+Proof. intros a b; lia. Qed.
+
+Lemma delivered_eq_data :
+  forall (A:Type) (data:list A) L,
+    L = 8 + lenN data ->
+    take (N.to_nat (L - 8)) data = data.
+Proof.
+  intros A data L HL.
+  rewrite HL.
+  rewrite N_add_sub_cancel_l.
+  rewrite N_to_nat_lenN.
+  apply take_length_id.
+Qed.
+
+Lemma dst_port0_test_reject_nonzero_h0 :
+  forall sp dp (data:list byte) h0,
+    mk_header sp dp (lenN (A:=byte) data) = Some h0 ->
+    to_word16 dp <> 0 ->
+    N.eqb (dst_port h0) 0 = false.
+Proof.
+  intros sp dp data h0 Hmk Hnz.
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [Hdp _]]].
+  rewrite Hdp. apply N.eqb_neq. exact Hnz.
+Qed.
+
+(* Helper lemmas to avoid computing checksums *)
+
+Lemma encode_produces_h1_wire :
+  forall ipS ipD sp dp data h0 wire,
     mk_header sp dp (lenN data) = Some h0 ->
     encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4 ipS ipD wire
-      = Ok (to_word16 sp, to_word16 dp, data).
+    exists c, c <> 0 /\
+    wire = udp_header_bytes 
+      {| src_port := src_port h0;
+         dst_port := dst_port h0;
+         length16 := length16 h0;
+         checksum := c |} ++ data.
 Proof.
-  intros ipS ipD sp dp data wire h0 Hdp16NZ Hmk Henc.
-  unfold encode_udp_ipv4 in Henc.
-  rewrite Hmk in Henc.
-  destruct (checksum_tx_mode defaults_ipv4) eqn:Etx; [|discriminate].
-  inversion Henc; subst wire; clear Henc.
-  set (h1 := {| src_port := src_port h0 ;
-                dst_port := dst_port h0 ;
-                length16 := length16 h0 ;
-                checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
-  unfold decode_udp_ipv4.
-  assert (Hnorm: header_norm h1) by apply header_norm_encode_h1.
-  rewrite (parse_header_bytes_of_header_norm h1 data Hnorm). cbn.
-  rewrite N.eqb_neq.
-  2:{ unfold h1. simpl.
-      destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [Hdp _]]].
-      rewrite Hdp. exact Hdp16NZ. }
-  set (Nbytes := lenN (udp_header_bytes h1 ++ data)).
-  set (L := length16 h1).
-  assert (HNbytes: Nbytes = 8 + lenN data).
-  { unfold Nbytes. rewrite lenN_app, lenN_udp_header_bytes_8. lia. }
-  assert (HL: L = to_word16 (8 + lenN data)).
-  { unfold L, h1. simpl.
-    destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL0 _]]]]. exact HL0. }
-  assert (Hle: 8 + lenN data <= mask16) by (destruct (mk_header_ok _ _ _ _ Hmk) as [Hle' _]; exact Hle').
-  assert (HLid: to_word16 (8 + lenN data) = 8 + lenN data) by (apply to_word16_id_if_le_mask; exact Hle).
-  rewrite HNbytes, HL, HLid.
-  rewrite N.ltb_ge; [|lia].
-  rewrite N.ltb_ge; [|lia].
-  rewrite N.eqb_eq; [|lia].
-  destruct (N.eqb (checksum h1) 0) eqn:Eck.
-  - exfalso.
-    unfold h1 in Eck; simpl in Eck.
-    apply N.eqb_eq in Eck.
-    pose proof (compute_udp_checksum_ipv4_nonzero ipS ipD h0 data) as Hnz.
-    congruence.
-  - rewrite (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1 Hmk eq_refl).
-    f_equal. f_equal. f_equal.
-    all: try (unfold h1; simpl;
-              destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]];
-              now rewrite Hsp || rewrite Hdp).
+  intros ipS ipD sp dp data h0 wire Hmk Henc.
+  exists (compute_udp_checksum_ipv4 ipS ipD h0 data).
+  split.
+  - apply compute_udp_checksum_ipv4_nonzero.
+  - apply (encode_udp_defaults_wire_eq_fast ipS ipD sp dp data h0 _ wire Hmk).
+    + reflexivity.
+    + exact Henc.
 Qed.
 
-(* MAIN Theorem B (StrictEq):
-   Alternate defaults (Allow destination-port 0). No premise required. *)
-Theorem decode_encode_roundtrip_ipv4_defaults_allow0 :
-  forall ipS ipD sp dp data wire h0,
+Lemma h1_checksum_nonzero :
+  forall ipS ipD sp dp data h0,
     mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_allow0 ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4_allow0 ipS ipD wire
-      = Ok (to_word16 sp, to_word16 dp, data).
+    let h1 := {| src_port := src_port h0;
+                 dst_port := dst_port h0;
+                 length16 := length16 h0;
+                 checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |} in
+    checksum h1 <> 0.
 Proof.
-  intros ipS ipD sp dp data wire h0 Hmk Henc.
-  unfold encode_udp_ipv4 in Henc.
-  rewrite Hmk in Henc.
-  destruct (checksum_tx_mode defaults_ipv4_allow0) eqn:Etx; [|discriminate].
-  inversion Henc; subst wire; clear Henc.
-  set (h1 := {| src_port := src_port h0 ;
-                dst_port := dst_port h0 ;
-                length16 := length16 h0 ;
-                checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
-  unfold decode_udp_ipv4.
-  assert (Hnorm: header_norm h1) by apply header_norm_encode_h1.
-  rewrite (parse_header_bytes_of_header_norm h1 data Hnorm). cbn.
-  set (Nbytes := lenN (udp_header_bytes h1 ++ data)).
-  set (L := length16 h1).
-  assert (HNbytes: Nbytes = 8 + lenN data).
-  { unfold Nbytes. rewrite lenN_app, lenN_udp_header_bytes_8. lia. }
-  assert (HL: L = to_word16 (8 + lenN data)).
-  { unfold L, h1. simpl.
-    destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [_ [HL0 _]]]]; exact HL0. }
-  assert (Hle: 8 + lenN data <= mask16) by (destruct (mk_header_ok _ _ _ _ Hmk) as [Hle' _]; exact Hle').
-  assert (HLid: to_word16 (8 + lenN data) = 8 + lenN data) by (apply to_word16_id_if_le_mask; exact Hle).
-  rewrite HNbytes, HL, HLid.
-  rewrite N.ltb_ge; [|lia].
-  rewrite N.ltb_ge; [|lia].
-  rewrite N.eqb_eq; [|lia].
-  destruct (N.eqb (checksum h1) 0) eqn:Eck.
-  - exfalso.
-    unfold h1 in Eck; simpl in Eck.
-    apply N.eqb_eq in Eck.
-    pose proof (compute_udp_checksum_ipv4_nonzero ipS ipD h0 data) as Hnz.
-    congruence.
-  - rewrite (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1 Hmk eq_refl).
-    f_equal. f_equal. f_equal.
-    all: try (unfold h1; simpl;
-              destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]];
-              now rewrite Hsp || rewrite Hdp).
+  intros. apply compute_udp_checksum_ipv4_nonzero.
 Qed.
 
-(* ----------------------------------------------------------------------------
-   8') Encode→Decode round-trips (AcceptShorterIP)
-   --------------------------------------------------------------------------*)
-
-Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_acceptShorter :
-  forall ipS ipD sp dp data wire h0,
-    to_word16 dp <> 0%N ->
+Lemma verify_with_computed_checksum :
+  forall ipS ipD sp dp data h0,
     mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_acceptShorter ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4_acceptShorter ipS ipD wire
-      = Ok (to_word16 sp, to_word16 dp, data).
+    let c := compute_udp_checksum_ipv4 ipS ipD h0 data in
+    let h1 := {| src_port := src_port h0;
+                 dst_port := dst_port h0;
+                 length16 := length16 h0;
+                 checksum := c |} in
+    verify_checksum_ipv4 ipS ipD h1 data = true.
 Proof.
-  intros ipS ipD sp dp data wire h0 Hdp16NZ Hmk Henc.
-  unfold encode_udp_ipv4 in Henc.
-  rewrite Hmk in Henc.
-  destruct (checksum_tx_mode defaults_ipv4_acceptShorter) eqn:Etx; [|discriminate].
-  inversion Henc; subst wire; clear Henc.
-  set (h1 := {| src_port := src_port h0 ;
-                dst_port := dst_port h0 ;
-                length16 := length16 h0 ;
-                checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
-  unfold decode_udp_ipv4.
-  assert (Hnorm: header_norm h1) by apply header_norm_encode_h1.
-  rewrite (parse_header_bytes_of_header_norm h1 data Hnorm). cbn.
-  rewrite N.eqb_neq.
-  2:{ unfold h1. simpl.
-      destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [Hdp _]]].
-      rewrite Hdp. exact Hdp16NZ. }
-  set (Nbytes := lenN (udp_header_bytes h1 ++ data)).
-  set (L := length16 h1).
-  assert (HNbytes: Nbytes = 8 + lenN data).
-  { unfold Nbytes. rewrite lenN_app, lenN_udp_header_bytes_8. lia. }
-  assert (HL: L = to_word16 (8 + lenN data)).
-  { unfold L, h1. simpl.
-    destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL0 _]]]]. exact HL0. }
-  assert (Hle: 8 + lenN data <= mask16) by (destruct (mk_header_ok _ _ _ _ Hmk) as [Hle' _]; exact Hle').
-  assert (HLid: to_word16 (8 + lenN data) = 8 + lenN data) by (apply to_word16_id_if_le_mask; exact Hle).
-  rewrite HNbytes, HL, HLid.
-  rewrite N.ltb_ge; [|lia].
-  rewrite N.ltb_ge; [|lia].
-  destruct (N.eqb (checksum h1) 0) eqn:Eck.
-  - exfalso. unfold h1 in Eck; simpl in Eck.
-    apply N.eqb_eq in Eck.
-    pose proof (compute_udp_checksum_ipv4_nonzero ipS ipD h0 data) as Hnz.
-    congruence.
-  - rewrite (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1 Hmk eq_refl).
-    f_equal. f_equal. f_equal.
-    all: try (unfold h1; simpl;
-              destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]];
-              now rewrite Hsp || rewrite Hdp).
+  intros.
+  apply (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0).
+  - exact H.
+  - reflexivity.
 Qed.
 
-Theorem decode_encode_roundtrip_ipv4_defaults_allow0_acceptShorter :
-  forall ipS ipD sp dp data wire h0,
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_allow0_acceptShorter ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4_allow0_acceptShorter ipS ipD wire
-      = Ok (to_word16 sp, to_word16 dp, data).
+(*
+===============================================================================
+Fixed UDP/IPv4 instance: round‑trip and ancillary properties
+===============================================================================
+*)
+
+Section UDP_Fixed_Instance.
+  Open Scope N_scope.
+
+  (* Fixed parameters. *)
+  Definition ex_src := mkIPv4 192 0 2 1.
+  Definition ex_dst := mkIPv4 192 0 2 99.
+  Definition ex_sp  : word16 := 40000.
+  Definition ex_dp  : word16 := 4242.
+  Definition ex_payload : list byte := [1;2;3].
+
+  (* Wire obtained from the encoder (defaults). *)
+  Definition ex_wire : list byte :=
+    match encode_udp_ipv4 defaults_ipv4 ex_src ex_dst ex_sp ex_dp ex_payload with
+    | inl w  => w
+    | inr _  => []
+    end.
+
+  Example ex_encode_ok :
+    exists w,
+      encode_udp_ipv4 defaults_ipv4 ex_src ex_dst ex_sp ex_dp ex_payload = Ok w.
+  Proof. vm_compute. eexists; reflexivity. Qed.
+
+  Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 :
+    forall ipS ipD sp dp data wire h0,
+      to_word16 dp <> 0%N ->
+      mk_header sp dp (lenN data) = Some h0 ->
+      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
+      decode_udp_ipv4 defaults_ipv4 ipS ipD wire
+        = Ok (to_word16 sp, to_word16 dp, data).
+  Proof.
+    intros ipS ipD sp dp data wire h0 Hdp_nz Hmk Henc.
+    set (h1 :=
+          {| src_port := src_port h0;
+             dst_port := dst_port h0;
+             length16 := length16 h0;
+             checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
+
+    assert (Hwire : wire = udp_header_bytes h1 ++ data).
+    { apply (encode_udp_defaults_wire_eq_fast ipS ipD sp dp data h0 h1);
+        [exact Hmk|reflexivity|exact Henc]. }
+
+    rewrite Hwire. unfold decode_udp_ipv4.
+    assert (Hnorm : header_norm h1) by (eapply header_norm_encode_h1; eauto).
+    rewrite (parse_header_bytes_of_header_norm h1 data Hnorm).
+
+    destruct (dst_port0_policy defaults_ipv4) eqn:Epol.
+    - assert (E_dp0 : dst_port0_policy defaults_ipv4 = Reject) by reflexivity.
+      rewrite E_dp0 in Epol. discriminate.
+    - assert (Hdp_h1_eq : dst_port h1 = to_word16 dp).
+      { unfold h1.
+        destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [Hdp_h0 _]]]; exact Hdp_h0. }
+      assert (Eport : (N.eqb (dst_port h1) 0) = false)
+        by (apply N.eqb_neq; rewrite Hdp_h1_eq; exact Hdp_nz).
+      rewrite Eport.
+
+      set (Nbytes := lenN (udp_header_bytes h1 ++ data)).
+      set (L := length16 h1).
+
+      assert (HL : L = 8 + lenN data).
+      { unfold L, h1.
+        destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL0 _]]]].
+        rewrite HL0. now apply to_word16_id_if_le_mask. }
+
+      assert (HNbytes : Nbytes = 8 + lenN data)
+        by (unfold Nbytes; apply lenN_wire_from_header_bytes).
+
+      assert (EL8  : (L <? 8) = false)      by (rewrite HL; apply N.ltb_ge; lia).
+      assert (ENbL : (Nbytes <? L) = false) by (rewrite HNbytes, HL; apply N.ltb_ge; lia).
+      rewrite EL8, ENbL.
+
+      assert (Emode : length_rx_mode defaults_ipv4 = StrictEq) by reflexivity.
+      rewrite Emode.
+
+      assert (EEq : N.eqb Nbytes L = true) by (apply N.eqb_eq; now rewrite HNbytes, HL).
+      rewrite EEq.
+
+      assert (Eck : N.eqb (checksum h1) 0 = false).
+      { unfold h1. apply N.eqb_neq. apply compute_udp_checksum_ipv4_nonzero. }
+      rewrite Eck.
+
+      assert (Hver :
+                verify_checksum_ipv4 ipS ipD h1
+                  (take (N.to_nat (L - 8)) data) = true).
+      { rewrite HL, N_add_sub_cancel_l, N_to_nat_lenN, take_length_id.
+        eapply (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1);
+          [exact Hmk|reflexivity]. }
+      rewrite Hver.
+
+      apply f_equal.
+      assert (Hsrc : src_port h1 = to_word16 sp).
+      { unfold h1.
+        destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp _]]. exact Hsp. }
+      assert (Hdata :
+                take (N.to_nat (L - 8)) data = data).
+      { rewrite HL, N_add_sub_cancel_l, N_to_nat_lenN. apply take_length_id. }
+      rewrite Hsrc, Hdp_h1_eq, Hdata. reflexivity.
+  Qed.
+
+  Definition no_listener (_:IPv4) (_:word16) : bool := false.
+
+  Lemma ex_unicast : is_multicast_ipv4 ex_dst = false.
+  Proof. vm_compute. reflexivity. Qed.
+
+Example ex_icmp_advice :
+  udp_complete_icmp_advice defaults_ipv4 no_listener ex_src ex_dst
+     (decode_udp_ipv4_with_addrs defaults_ipv4 ex_src ex_dst ex_wire)
+  = SendICMPDestUnreach ICMP_PORT_UNREACH.
 Proof.
-  intros ipS ipD sp dp data wire h0 Hmk Henc.
-  unfold encode_udp_ipv4 in Henc.
-  rewrite Hmk in Henc.
-  destruct (checksum_tx_mode defaults_ipv4_allow0_acceptShorter) eqn:Etx; [|discriminate].
-  inversion Henc; subst wire; clear Henc.
-  set (h1 := {| src_port := src_port h0 ;
-                dst_port := dst_port h0 ;
-                length16 := length16 h0 ;
-                checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
-  unfold decode_udp_ipv4.
-  assert (Hnorm: header_norm h1) by apply header_norm_encode_h1.
-  rewrite (parse_header_bytes_of_header_norm h1 data Hnorm). cbn.
-  set (Nbytes := lenN (udp_header_bytes h1 ++ data)).
-  set (L := length16 h1).
-  assert (HNbytes: Nbytes = 8 + lenN data).
-  { unfold Nbytes. rewrite lenN_app, lenN_udp_header_bytes_8. lia. }
-  assert (HL: L = to_word16 (8 + lenN data)).
-  { unfold L, h1. simpl.
-    destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [_ [HL0 _]]]]; exact HL0. }
-  assert (Hle: 8 + lenN data <= mask16) by (destruct (mk_header_ok _ _ _ _ Hmk) as [Hle' _]; exact Hle').
-  assert (HLid: to_word16 (8 + lenN data) = 8 + lenN data) by (apply to_word16_id_if_le_mask; exact Hle).
-  rewrite HNbytes, HL, HLid.
-  rewrite N.ltb_ge; [|lia].
-  rewrite N.ltb_ge; [|lia].
-  destruct (N.eqb (checksum h1) 0) eqn:Eck.
-  - exfalso. unfold h1 in Eck; simpl in Eck.
-    apply N.eqb_eq in Eck.
-    pose proof (compute_udp_checksum_ipv4_nonzero ipS ipD h0 data) as Hnz.
-    congruence.
-  - rewrite (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1 Hmk eq_refl).
-    f_equal. f_equal. f_equal.
-    all: try (unfold h1; simpl;
-              destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]];
-              now rewrite Hsp || rewrite Hdp).
+  unfold ex_wire.
+  destruct ex_encode_ok as [w Hw]. rewrite Hw.
+  replace (match Ok w with inl w0 => w0 | inr _ => [] end) with w by reflexivity.
+
+  (* Existence of a header from the successful encode. *)
+  assert (Hexists : exists h0, mk_header ex_sp ex_dp (lenN ex_payload) = Some h0).
+  { unfold encode_udp_ipv4 in Hw.
+    destruct (mk_header ex_sp ex_dp (lenN ex_payload)) as [h0|] eqn:Hmk; [now eexists|discriminate]. }
+  destruct Hexists as [h0 Hmk].
+
+  (* Destination port is nonzero in 16 bits. *)
+  assert (Hdp_lt : ex_dp < two16) by (cbv [ex_dp two16]; lia).
+  assert (Hdp_nz : to_word16 ex_dp <> 0).
+  { intro Heq. rewrite (to_word16_id_if_lt ex_dp Hdp_lt) in Heq; cbv [ex_dp] in Heq; discriminate. }
+
+  (* Collapse decode via the round‑trip theorem. *)
+  pose proof (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16
+                ex_src ex_dst ex_sp ex_dp ex_payload w h0 Hdp_nz Hmk Hw) as Hrt.
+
+  (* Conclude the advice decision. *)
+  unfold decode_udp_ipv4_with_addrs. cbn. rewrite Hrt. cbn.
+  cbn [udp_complete_icmp_advice should_send_icmp udp_rx_icmp_advice defaults_ipv4].
+  reflexivity.
 Qed.
 
-(* ----------------------------------------------------------------------------
-   8'') Address-carrying round-trips (corollaries)
-   --------------------------------------------------------------------------*)
+  Example ex_total_length_matches :
+    lenN ex_wire = 8 + lenN ex_payload.
+  Proof.
+    unfold ex_wire.
+    destruct ex_encode_ok as [w Henc_w]. rewrite Henc_w. cbn.
+    assert (Hmk : exists h0, mk_header ex_sp ex_dp (lenN ex_payload) = Some h0).
+    { unfold encode_udp_ipv4 in Henc_w.
+      destruct (mk_header ex_sp ex_dp (lenN ex_payload)) as [h0|] eqn:E; [eauto|discriminate]. }
+    destruct Hmk as [h0 Hmk].
+    set (h1 :=
+          {| src_port := src_port h0;
+             dst_port := dst_port h0;
+             length16 := length16 h0;
+             checksum := compute_udp_checksum_ipv4 ex_src ex_dst h0 ex_payload |}).
+    unfold encode_udp_ipv4 in Henc_w. rewrite Hmk in Henc_w.
+    change (checksum_tx_mode defaults_ipv4) with WithChecksum in Henc_w.
+    apply Ok_inj in Henc_w. rewrite <- Henc_w.
+    apply lenN_wire_from_header_bytes.
+  Qed.
 
-Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_with_addrs :
-  forall ipS ipD sp dp data wire h0,
-    to_word16 dp <> 0%N ->
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire
-      = Ok {| src_ip_out := ipS
-            ; dst_ip_out := ipD
-            ; src_port_out := to_word16 sp
-            ; dst_port_out := to_word16 dp
-            ; payload_out := data |}.
-Proof.
-  intros. unfold decode_udp_ipv4_with_addrs.
-  rewrite (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16
-             ipS ipD sp dp data wire h0); auto. reflexivity.
-Qed.
+End UDP_Fixed_Instance.
 
-Theorem decode_encode_roundtrip_ipv4_defaults_allow0_with_addrs :
-  forall ipS ipD sp dp data wire h0,
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_allow0 ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire
-      = Ok {| src_ip_out := ipS
-            ; dst_ip_out := ipD
-            ; src_port_out := to_word16 sp
-            ; dst_port_out := to_word16 dp
-            ; payload_out := data |}.
-Proof.
-  intros. unfold decode_udp_ipv4_with_addrs.
-  rewrite (decode_encode_roundtrip_ipv4_defaults_allow0
-             ipS ipD sp dp data wire h0); auto. reflexivity.
-Qed.
+(** ****************************************************************************
+    Status note: UDP over IPv4 (RFC 768) with selected RFC 1122 obligations
+    ----------------------------------------------------------------------------
+    Scope.
+      This development formalizes the UDP/IPv4 wire format and core processing
+      rules as in RFC 768, together with the receive‑side obligations needed
+      by applications (specific‑destination address delivery) and basic ICMP
+      advice selection as in RFC 1122 §4.1.  IPv6 is out of scope.  IP
+      fragmentation/reassembly and socket demultiplexing are assumed to be
+      provided by the IP/host environment and are not modeled here.
 
-Theorem decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_with_addrs_acceptShorter :
-  forall ipS ipD sp dp data wire h0,
-    to_word16 dp <> 0%N ->
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_acceptShorter ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4_with_addrs defaults_ipv4_acceptShorter ipS ipD wire
-      = Ok {| src_ip_out := ipS
-            ; dst_ip_out := ipD
-            ; src_port_out := to_word16 sp
-            ; dst_port_out := to_word16 dp
-            ; payload_out := data |}.
-Proof.
-  intros. unfold decode_udp_ipv4_with_addrs.
-  rewrite (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_acceptShorter
-             ipS ipD sp dp data wire h0); auto. reflexivity.
-Qed.
+      (Remark: RFC 9535 is the JSONPath specification and orthogonal to this
+      work; the present formalization targets UDP as specified by RFC 768.)
 
-Theorem decode_encode_roundtrip_ipv4_defaults_allow0_with_addrs_acceptShorter :
-  forall ipS ipD sp dp data wire h0,
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_allow0_acceptShorter ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4_with_addrs defaults_ipv4_allow0_acceptShorter ipS ipD wire
-      = Ok {| src_ip_out := ipS
-            ; dst_ip_out := ipD
-            ; src_port_out := to_word16 sp
-            ; dst_port_out := to_word16 dp
-            ; payload_out := data |}.
-Proof.
-  intros. unfold decode_udp_ipv4_with_addrs.
-  rewrite (decode_encode_roundtrip_ipv4_defaults_allow0_acceptShorter
-             ipS ipD sp dp data wire h0); auto. reflexivity.
-Qed.
+    Summary of completed artifacts.
+      • Header layout and big‑endian serialization/deserialization with
+        normalization; parsing inverts serialization under [header_norm].
+      • Length discipline: [length16 = 8 + |payload|], lower bound 8, guards
+        on decode; encoder/decoder agree on total length.
+      • Internet checksum: one’s‑complement end‑around sum over the IPv4
+        pseudo‑header, header‑with‑zero checksum, and data, with odd‑length
+        padding; associativity/closure of the arithmetic; encode→verify
+        correctness; “0 → 0xFFFF” transmission rule.
+      • Encode→Decode (left‑inverse) theorems for the default policies
+        (Reject destination‑port 0, StrictEq) and for the Allow0/AcceptShorter
+        variants; address‑carrying corollaries; ICMP advice lemmas for the
+        listener/no‑listener cases.
+      • Executable examples exercising odd‑length payloads, default length
+        equality, and advisory outcomes.
 
-(* ----------------------------------------------------------------------------
-   8''') ICMP-aware round-trips with advice
-   --------------------------------------------------------------------------*)
+    Remaining work to reach a “full” core RFC 768 formalization here.
+      R1. Decoder→Encoder completeness (canonicalization).
+          Prove that any wire accepted by [decode_udp_ipv4 defaults_ipv4]
+          equals the result of [encode_udp_ipv4 defaults_ipv4] on the triple
+          it returns, modulo the 0→0xFFFF checksum canonicalization.
+          (Excludes acceptance of non‑canonical but verifying wires.)
 
-(* Encoder never produces packets that trigger ICMP on decode when a listener exists. *)
-Theorem encode_decode_no_icmp_on_success :
-  forall ipS ipD sp dp data wire h0 has_listener,
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4 ipS ipD wire = Ok (to_word16 sp, to_word16 dp, data) ->
-    has_listener ipD (to_word16 dp) = true ->
-    udp_rx_icmp_advice has_listener
-      (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire) = NoAdvice.
-Proof.
-  intros ipS ipD sp dp data wire h0 has_listener Hmk Henc Hdec Hlistener.
-  unfold udp_rx_icmp_advice.
-  unfold decode_udp_ipv4_with_addrs.
-  rewrite Hdec. simpl.
-  rewrite Hlistener. reflexivity.
-Qed.
+      R2. AcceptShorter surplus‑octet case.
+          Extend the proofs under [AcceptShorterIP] to the case Nbytes > L,
+          showing that the decoder delivers exactly the first L−8 octets and
+          ignores any surplus supplied by IP.
 
-(* Port unreachable is generated when no listener exists. *)
-Theorem decode_generates_port_unreachable :
-  forall ipS ipD sp dp data wire h0 has_listener,
-    mk_header sp dp (lenN data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4 ipS ipD wire = Ok (to_word16 sp, to_word16 dp, data) ->
-    has_listener ipD (to_word16 dp) = false ->
-    udp_rx_icmp_advice has_listener
-      (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire) =
-      SendICMPDestUnreach ICMP_PORT_UNREACH.
-Proof.
-  intros ipS ipD sp dp data wire h0 has_listener Hmk Henc Hdec Hno_listener.
-  unfold udp_rx_icmp_advice.
-  unfold decode_udp_ipv4_with_addrs.
-  rewrite Hdec. simpl.
-  rewrite Hno_listener. reflexivity.
-Qed.
+      R3. ICMP suppression refinements (advice interface).
+          Extend [udp_complete_icmp_advice] with minimal IP metadata
+          (e.g., link‑layer broadcast, initial‑fragment flag, source‑address
+          class) and prove the expected suppressions (no ICMP for LL
+          broadcast, non‑initial fragments, non‑unicast/invalid sources).
 
-(* ----------------------------------------------------------------------------
-   9) Small executable examples (sanity checks)
-   --------------------------------------------------------------------------*)
+      R4. Optional input screening of invalid sources.
+          Either state an explicit IP‑layer assumption or add a UDP‑layer
+          guard for invalid/non‑unicast sources and show that it preserves the
+          established round‑trip theorems when the premise holds.
 
-Definition EX_src := mkIPv4 192 0 2 1.
-Definition EX_dst := mkIPv4 198 51 100 2.
-Definition EX_data : list byte := [ 104; 105 ].
-Definition EX_data_odd : list byte := [ 42 ].
+      R5. Small conformance lemmas.
+          (a) Injectivity of [udp_header_bytes] under [header_norm].
+          (b) Encoder monotonicity: [encode = Err Oversize] ⇔ [8 + lenN data > mask16].
+          (c) Verification stability under AcceptShorter (verifier depends
+              only on the L‑bounded prefix), stated as an explicit lemma.
 
-Example EX_encode_ok :
-  exists wire h0, mk_header 5353 9999 (lenN EX_data) = Some h0
-              /\ encode_udp_ipv4 defaults_ipv4 EX_src EX_dst 5353 9999 EX_data = Ok wire.
-Proof.
-  unfold encode_udp_ipv4, mk_header, lenN, EX_data.
-  simpl. rewrite N.leb_le by lia. eexists. eexists. split; [reflexivity|].
-  simpl. reflexivity.
-Qed.
+    Done‑conditions (to declare the core complete here).
+      D1. A proved decoder→encoder completeness theorem for the defaults.
+      D2. A proved AcceptShorter surplus‑octet theorem (R2).
+      D3. ICMP advice extended with the suppression matrix and corresponding
+          proofs (R3).
+      D4. Conformance lemmas (R5a–c).
 
-(* Under Reject policy, require the exact modular premise to_word16 dp ≠ 0. *)
-Example EX_roundtrip_reject_nonzero16 :
-  forall wire h0,
-    mk_header 5353 9999 (lenN EX_data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 EX_src EX_dst 5353 9999 EX_data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4 EX_src EX_dst wire
-      = Ok (to_word16 5353, to_word16 9999, EX_data).
-Proof.
-  intros wire h0 Hmk Henc.
-  apply (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16
-           EX_src EX_dst 5353 9999 EX_data wire h0).
-  - change (9999 mod 65536 <> 0). cbv; discriminate.
-  - exact Hmk.
-  - exact Henc.
-Qed.
+    Required minimal examples accompanying the above.
+      E1. A concrete wire with surplus octets (Nbytes > L) that is accepted
+          under [AcceptShorterIP] and delivers exactly the prefix of length
+          L−8; a negative example showing rejection under [StrictEq].
+      E2. An example demonstrating encoder oversize rejection at the boundary
+          ([8 + lenN data = mask16 + 1]) and acceptance just below it.
+      E3. ICMP advice examples showing suppression for (i) destination
+          multicast/broadcast (already present), (ii) link‑layer broadcast,
+          and (iii) non‑initial fragments once the metadata is added.
 
-(* Under Allow policy, no premise needed. *)
-Example EX_roundtrip_allow0 :
-  forall wire h0,
-    mk_header 5353 0 (lenN EX_data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4_allow0 EX_src EX_dst 5353 0 EX_data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4_allow0 EX_src EX_dst wire
-      = Ok (to_word16 5353, to_word16 0, EX_data).
-Proof.
-  intros wire h0 Hmk Henc.
-  eapply decode_encode_roundtrip_ipv4_defaults_allow0; eauto.
-Qed.
+    With D1–D4 proved and E1–E3 present, the UDP/IPv4 core (RFC 768) and the
+    exercised RFC 1122 obligations in this file can be regarded as complete.
+    **************************************************************************** *)
 
-(* Address-carrying example *)
-Example EX_roundtrip_with_addrs :
-  forall wire h0,
-    mk_header 5353 9999 (lenN EX_data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 EX_src EX_dst 5353 9999 EX_data = Ok wire ->
-    decode_udp_ipv4_with_addrs defaults_ipv4 EX_src EX_dst wire
-      = Ok {| src_ip_out := EX_src
-            ; dst_ip_out := EX_dst
-            ; src_port_out := to_word16 5353
-            ; dst_port_out := to_word16 9999
-            ; payload_out := EX_data |}.
-Proof.
-  intros; eapply decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_with_addrs; eauto.
-Qed.
-
-(* Odd-length payload example (pads one zero byte for checksum computation). *)
-Example EX_roundtrip_oddlen :
-  forall wire h0,
-    mk_header 5353 9999 (lenN EX_data_odd) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 EX_src EX_dst 5353 9999 EX_data_odd = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4 EX_src EX_dst wire
-      = Ok (to_word16 5353, to_word16 9999, EX_data_odd).
-Proof.
-  intros wire h0 Hmk Henc.
-  eapply decode_encode_roundtrip_ipv4_defaults_reject_nonzero16; eauto.
-  change (9999 mod 65536 <> 0). cbv; discriminate.
-Qed.
-
-(* Multicast destination suppresses ICMP. *)
-Definition EX_multicast_dst := mkIPv4 224 0 0 1.
-
-Example EX_no_icmp_for_multicast :
-  forall has_listener,
-    should_send_icmp defaults_ipv4 EX_multicast_dst = false.
-Proof.
-  intro has_listener.
-  unfold should_send_icmp, is_multicast_ipv4, EX_multicast_dst.
-  simpl. reflexivity.
-Qed.
-
-(* NEW: example documenting RFC 768 "source port optional (0 permitted)". *)
-Example EX_roundtrip_src_port_zero :
-  forall wire h0,
-    mk_header 0 9999 (lenN EX_data) = Some h0 ->
-    encode_udp_ipv4 defaults_ipv4 EX_src EX_dst 0 9999 EX_data = Ok wire ->
-    decode_udp_ipv4 defaults_ipv4 EX_src EX_DST wire
-      = Ok (to_word16 0, to_word16 9999, EX_data).
-Proof.
-  intros wire h0 Hmk Henc.
-  apply (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16
-           EX_src EX_DST 0 9999 EX_data wire h0).
-  - change (9999 mod 65536 <> 0). cbv; discriminate.
-  - exact Hmk.
-  - exact Henc.
-Qed.
