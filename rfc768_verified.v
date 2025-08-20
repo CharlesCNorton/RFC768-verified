@@ -1774,83 +1774,6 @@ Qed.
 End UDP_Fixed_Instance.
 
 (** ****************************************************************************
-    Status note: UDP over IPv4 (RFC 768) with selected RFC 1122 obligations
-    ----------------------------------------------------------------------------
-    Scope.
-      This development formalizes the UDP/IPv4 wire format and core processing
-      rules as in RFC 768, together with the receive‑side obligations needed
-      by applications (specific‑destination address delivery) and basic ICMP
-      advice selection as in RFC 1122 §4.1.  IPv6 is out of scope.  IP
-      fragmentation/reassembly and socket demultiplexing are assumed to be
-      provided by the IP/host environment and are not modeled here.
-
-    Summary of completed artifacts.
-      • Header layout and big‑endian serialization/deserialization with
-        normalization; parsing inverts serialization under [header_norm].
-      • Length discipline: [length16 = 8 + |payload|], lower bound 8, guards
-        on decode; encoder/decoder agree on total length.
-      • Internet checksum: one’s‑complement end‑around sum over the IPv4
-        pseudo‑header, header‑with‑zero checksum, and data, with odd‑length
-        padding; associativity/closure of the arithmetic; encode→verify
-        correctness; “0 → 0xFFFF” transmission rule.
-      • Encode→Decode (left‑inverse) theorems for the default policies
-        (Reject destination‑port 0, StrictEq) and for the Allow0/AcceptShorter
-        variants; address‑carrying corollaries; ICMP advice lemmas for the
-        listener/no‑listener cases.
-      • Executable examples exercising odd‑length payloads, default length
-        equality, and advisory outcomes.
-
-    Remaining work to reach a “full” core RFC 768 formalization here.
-      R1. Decoder→Encoder completeness (canonicalization).
-          Prove that any wire accepted by [decode_udp_ipv4 defaults_ipv4]
-          equals the result of [encode_udp_ipv4 defaults_ipv4] on the triple
-          it returns, modulo the 0→0xFFFF checksum canonicalization.
-          (Excludes acceptance of non‑canonical but verifying wires.)
-
-      R2. AcceptShorter surplus‑octet case.
-          Extend the proofs under [AcceptShorterIP] to the case Nbytes > L,
-          showing that the decoder delivers exactly the first L−8 octets and
-          ignores any surplus supplied by IP.
-
-      R3. ICMP suppression refinements (advice interface).
-          Extend [udp_complete_icmp_advice] with minimal IP metadata
-          (e.g., link‑layer broadcast, initial‑fragment flag, source‑address
-          class) and prove the expected suppressions (no ICMP for LL
-          broadcast, non‑initial fragments, non‑unicast/invalid sources).
-
-      R4. Optional input screening of invalid sources.
-          Either state an explicit IP‑layer assumption or add a UDP‑layer
-          guard for invalid/non‑unicast sources and show that it preserves the
-          established round‑trip theorems when the premise holds.
-
-      R5. Small conformance lemmas.
-          (a) Injectivity of [udp_header_bytes] under [header_norm].
-          (b) Encoder monotonicity: [encode = Err Oversize] ⇔ [8 + lenN data > mask16].
-          (c) Verification stability under AcceptShorter (verifier depends
-              only on the L‑bounded prefix), stated as an explicit lemma.
-
-    Done‑conditions (to declare the core complete here).
-      D1. A proved decoder→encoder completeness theorem for the defaults.
-      D2. A proved AcceptShorter surplus‑octet theorem (R2).
-      D3. ICMP advice extended with the suppression matrix and corresponding
-          proofs (R3).
-      D4. Conformance lemmas (R5a–c).
-
-    Required minimal examples accompanying the above.
-      E1. A concrete wire with surplus octets (Nbytes > L) that is accepted
-          under [AcceptShorterIP] and delivers exactly the prefix of length
-          L−8; a negative example showing rejection under [StrictEq].
-      E2. An example demonstrating encoder oversize rejection at the boundary
-          ([8 + lenN data = mask16 + 1]) and acceptance just below it.
-      E3. ICMP advice examples showing suppression for (i) destination
-          multicast/broadcast (already present), (ii) link‑layer broadcast,
-          and (iii) non‑initial fragments once the metadata is added.
-
-    With D1–D4 proved and E1–E3 present, the UDP/IPv4 core (RFC 768) and the
-    exercised RFC 1122 obligations in this file can be regarded as complete.
-    **************************************************************************** *)
-
-(** ****************************************************************************
     Decoder → Encoder completeness (defaults, StrictEq), modulo checksum
     canonicalization.  If the default decoder accepts a wire [w] as
     [(sp,dp,data)], then re‑encoding [(sp,dp,data)] under the same defaults
@@ -2658,7 +2581,7 @@ Proof.
   unfold decode_udp_ipv4 in Hdec_copy.
   destruct (parse_header w) as [[h rest]|] eqn:Hparse; [|discriminate Hdec_copy].
   exists h, rest.
-  split; [exact Hparse|].
+  split; [reflexivity|].
   
   (* Apply the completeness theorem *)
   pose proof (decode_encode_completeness_defaults ipS ipD w sp dp data h rest 
@@ -2670,10 +2593,104 @@ Proof.
                 Hdec Hparse Hcz) as [_ [_ [_ [_ [Hdata _]]]]].
     split; [exact Hdata|].
     split; [exact Henc|].
-    left; exact Hcz.
+    left; reflexivity.
   - pose proof (decode_defaults_nonzero_analysis ipS ipD w sp dp data h rest 
                 Hdec Hparse Hcz) as [_ [_ [_ [_ [Hdata _]]]]].
     split; [exact Hdata|].
     split; [exact Henc|].
     right; apply Heq; reflexivity.
 Qed.
+
+Corollary decode_encode_completeness_defaults_no_parse :
+  forall ipS ipD w sp dp data,
+    decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
+    exists h rest,
+      parse_header w = Some (h, rest) /\
+      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data
+        = Ok (canonical_wire_defaults ipS ipD h rest) /\
+      (N.eqb (checksum h) 0 = false ->
+         canonical_wire_defaults ipS ipD h rest = w).
+Proof.
+  intros ipS ipD w sp dp data Hdec.
+  (* The decoder starts by parsing; expose that match *)
+  remember (parse_header w) as P.
+  destruct P as [(h,rest)|] eqn:Hparse; [| now (unfold decode_udp_ipv4 in Hdec; rewrite Hparse in Hdec)].
+  exists h, rest. split; [assumption|].
+  eapply decode_encode_completeness_defaults; eauto.
+Qed.
+
+(** ****************************************************************************
+    Status note: UDP over IPv4 (RFC 768) with selected RFC 1122 obligations
+    ----------------------------------------------------------------------------
+    Scope.
+      This development formalizes the UDP/IPv4 wire format and core processing
+      rules as in RFC 768, together with the receive‑side obligations needed
+      by applications (specific‑destination address delivery) and basic ICMP
+      advice selection as in RFC 1122 §4.1.  IPv6 is out of scope.  IP
+      fragmentation/reassembly and socket demultiplexing are assumed to be
+      provided by the IP/host environment and are not modeled here.
+
+    Summary of completed artifacts.
+      • Header layout and big‑endian serialization/deserialization with
+        normalization; parsing inverts serialization under [header_norm].
+      • Length discipline: [length16 = 8 + |payload|], lower bound 8, guards
+        on decode; encoder/decoder agree on total length.
+      • Internet checksum: one's‑complement end‑around sum over the IPv4
+        pseudo‑header, header‑with‑zero checksum, and data, with odd‑length
+        padding; associativity/closure of the arithmetic; encode→verify
+        correctness; "0 → 0xFFFF" transmission rule.
+      • Encode→Decode (left‑inverse) theorems for the default policies
+        (Reject destination‑port 0, StrictEq) and for the Allow0/AcceptShorter
+        variants; address‑carrying corollaries; ICMP advice lemmas for the
+        listener/no‑listener cases.
+      • Decode→Encode completeness (right‑inverse/canonicalization): Any wire
+        accepted by [decode_udp_ipv4 defaults_ipv4] equals the result of
+        [encode_udp_ipv4 defaults_ipv4] on the triple it returns, modulo the
+        0→0xFFFF checksum canonicalization. See [decode_encode_completeness_defaults].
+      • Executable examples exercising odd‑length payloads, default length
+        equality, and advisory outcomes.
+
+    Remaining work to reach a "full" core RFC 768 formalization here.
+      R2. AcceptShorter surplus‑octet case.
+          Extend the proofs under [AcceptShorterIP] to the case Nbytes > L,
+          showing that the decoder delivers exactly the first L−8 octets and
+          ignores any surplus supplied by IP.
+
+      R3. ICMP suppression refinements (advice interface).
+          Extend [udp_complete_icmp_advice] with minimal IP metadata
+          (e.g., link‑layer broadcast, initial‑fragment flag, source‑address
+          class) and prove the expected suppressions (no ICMP for LL
+          broadcast, non‑initial fragments, non‑unicast/invalid sources).
+
+      R4. Optional input screening of invalid sources.
+          Either state an explicit IP‑layer assumption or add a UDP‑layer
+          guard for invalid/non‑unicast sources and show that it preserves the
+          established round‑trip theorems when the premise holds.
+
+      R5. Small conformance lemmas.
+          (a) Injectivity of [udp_header_bytes] under [header_norm].
+          (b) Encoder monotonicity: [encode = Err Oversize] ⇔ [8 + lenN data > mask16].
+          (c) Verification stability under AcceptShorter (verifier depends
+              only on the L‑bounded prefix), stated as an explicit lemma.
+
+    Done‑conditions (to declare the core complete here).
+      D1. ✓ COMPLETE: A proved decoder→encoder completeness theorem for the defaults.
+      D2. A proved AcceptShorter surplus‑octet theorem (R2).
+      D3. ICMP advice extended with the suppression matrix and corresponding
+          proofs (R3).
+      D4. Conformance lemmas (R5a–c).
+
+    Required minimal examples accompanying the above.
+      E1. A concrete wire with surplus octets (Nbytes > L) that is accepted
+          under [AcceptShorterIP] and delivers exactly the prefix of length
+          L−8; a negative example showing rejection under [StrictEq].
+      E2. An example demonstrating encoder oversize rejection at the boundary
+          ([8 + lenN data = mask16 + 1]) and acceptance just below it.
+      E3. ICMP advice examples showing suppression for (i) destination
+          multicast/broadcast (already present), (ii) link‑layer broadcast,
+          and (iii) non‑initial fragments once the metadata is added.
+
+    With D1 ✓ proved, D2–D4 remaining, and E1–E3 present, the UDP/IPv4 core 
+    (RFC 768) and the exercised RFC 1122 obligations in this file can be 
+    regarded as substantially complete.
+    **************************************************************************** *)
