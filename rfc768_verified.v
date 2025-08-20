@@ -1885,74 +1885,93 @@ Proof.
   lia.
 Qed.
 
-  Lemma header_norm_of_parse_success :
-    forall w h rest,
-      parse_header w = Some (h, rest) -> header_norm h.
-  Proof.
-    intros w h rest H.
-    unfold parse_header in H.
-    repeat (destruct w as [|? w]; try discriminate).
-    cbn in H.
-    destruct (forallb is_byte [a; a0; a1; a2; a3; a4; a5; a6]) eqn:Hall; try discriminate.
-    inversion H; subst h rest; clear H.
-    repeat split;
-      (eapply word16_of_be_lt_two16_of_is_byte;
-       try (apply (proj1 (forallb_forall _ _)). (* use [forallb_forall] to pull booleans *)
-            eassumption);
-       (* Provide membership proofs for each element in the 8‑list. *)
-       all: (cbn; repeat (first [left; reflexivity | right]); exact I)).
-  Qed.
+Lemma header_norm_of_parse_success :
+  forall w h rest,
+    parse_header w = Some (h, rest) -> header_norm h.
+Proof.
+  intros w h rest H.
+  unfold parse_header in H.
+  (* Decompose the 8 header octets *)
+  destruct w as [|s0 w]; try discriminate.
+  destruct w as [|s1 w]; try discriminate.
+  destruct w as [|d0 w]; try discriminate.
+  destruct w as [|d1 w]; try discriminate.
+  destruct w as [|l0 w]; try discriminate.
+  destruct w as [|l1 w]; try discriminate.
+  destruct w as [|c0 w]; try discriminate.
+  destruct w as [|c1 rest0]; try discriminate.
+  cbn in H.
 
-  (* Uniqueness of the non‑zero checksum chosen by the verifier. *)
-  Lemma verify_implies_checksum_equals_computed_nonzero :
-    forall ipS ipD h data,
-      header_norm h ->
-      verify_checksum_ipv4 ipS ipD h data = true ->
-      N.eqb (checksum h) 0 = false ->
-      checksum h = compute_udp_checksum_ipv4 ipS ipD h data.
-  Proof.
-    intros ipS ipD h data Hnorm Hver Hnz.
-    unfold verify_checksum_ipv4 in Hver.
-    apply N.eqb_eq in Hver.
-    set (ws := checksum_words_ipv4 ipS ipD h data) in *.
-    set (s  := sum16 ws).
-    assert (Hs: s < two16) by (unfold ws; apply sum16_lt_two16).
-    assert (Hck_lt: checksum h < two16) by (destruct Hnorm as [_ [_ [_ H]]]; exact H).
-    (* add16_ones s (checksum h) = mask16 *)
-    (* Consider whether s = mask16. *)
-    unfold compute_udp_checksum_ipv4.
-    destruct (N.eqb (cksum16 ws) 0) eqn:Ez.
-    - (* cksum16 ws = 0 → canonical transmit value = 0xFFFF *)
-      apply N.eqb_eq in Ez.
-      unfold cksum16, complement16 in Ez.
-      (* sum16 ws = mask16 *)
-      assert (s = mask16) by lia. clear Ez.
-      (* add16_ones s (checksum h) = mask16 ⇒ checksum h = mask16 *)
-      assert (checksum h = mask16).
-      { unfold add16_ones in Hver.
-        destruct (s + checksum h <? two16) eqn:Elt.
-        + apply N.ltb_lt in Elt. lia.
-        + apply N.ltb_ge in Elt. lia. }
-      now rewrite H.
-    - (* cksum16 ws ≠ 0 → canonical transmit value is cksum16 ws *)
-      apply N.eqb_neq in Ez.
-      unfold cksum16, complement16 in Ez.
-      (* s ≠ mask16 *)
-      assert (s <> mask16) by lia.
-      (* add16_ones s (checksum h) = mask16 forces checksum h = mask16 - s *)
-      assert (checksum h = mask16 - s).
-      { unfold add16_ones in Hver.
-        destruct (s + checksum h <? two16) eqn:Elt.
-        - apply N.ltb_lt in Elt. lia.
-        - apply N.ltb_ge in Elt.
-          (* If s + ck ≥ 2^16 then s + ck - 65535 = 65535 ⇒ ck = 2*65535 - s ≥ 65536 (contradicts ck < 2^16 unless s=65535). *)
-          assert (s = mask16) by lia. contradiction. }
-      (* And this equals cksum16 ws, since cksum16 ws = mask16 - s. *)
-      unfold compute_udp_checksum_ipv4.
-      rewrite <- H, N.eqb_false_iff in Ez.
-      2: { unfold cksum16, complement16. lia. }
-      now rewrite <- H.
-  Qed.
+  (* Split on the range guard produced by [forallb] *)
+  destruct (forallb is_byte [s0; s1; d0; d1; l0; l1; c0; c1]) eqn:Hall.
+  - (* Guard true: reduce the [if] and invert *)
+    simpl in Hall.                 (* turn [forallb … = true] into the andb-chain = true *)
+    rewrite Hall in H. cbn in H. inversion H; subst h rest; clear H.
+
+    (* Extract individual byte facts from the andb-chain *)
+    revert Hall; simpl; intro Hall.
+    apply Bool.andb_true_iff in Hall as [Hs0 Hall].
+    apply Bool.andb_true_iff in Hall as [Hs1 Hall].
+    apply Bool.andb_true_iff in Hall as [Hd0 Hall].
+    apply Bool.andb_true_iff in Hall as [Hd1 Hall].
+    apply Bool.andb_true_iff in Hall as [Hl0 Hall].
+    apply Bool.andb_true_iff in Hall as [Hl1 Hall].
+    apply Bool.andb_true_iff in Hall as [Hc0 Hall].
+    apply Bool.andb_true_iff in Hall as [Hc1 _].
+
+    (* Conclude each 16‑bit field is < 2^16 *)
+    unfold header_norm; simpl.
+    repeat split;
+      eapply word16_of_be_lt_two16_of_is_byte; eauto.
+  - (* Guard false: impossible since result is [Some …] *)
+    simpl in Hall. rewrite Hall in H. discriminate.
+Qed.
+
+(* --- Performance guardrail: block unfolding of heavy definitions locally --- *)
+Local Opaque
+  add16_ones sum16 to_word16
+  checksum_words_ipv4 compute_udp_checksum_ipv4
+  cksum16 complement16
+  bytes_of_words16_be words16_of_bytes_be be16_of_word16 word16_of_be
+  ipv4_words pseudo_header_v4.
+
+(* Step 1/4: reduce verifier truth to an add16_ones equation. *)
+Lemma verify_add16_mask16 :
+  forall ipS ipD h data,
+    header_norm h ->
+    verify_checksum_ipv4 ipS ipD h data = true ->
+    add16_ones (sum16 (checksum_words_ipv4 ipS ipD h data)) (checksum h) = mask16.
+Proof.
+  intros ipS ipD h data Hn Hver.
+  unfold verify_checksum_ipv4 in Hver.
+  apply N.eqb_eq in Hver.                      (* Hver : sum16 (ws ++ [ck]) = mask16 *)
+  set (ws := checksum_words_ipv4 ipS ipD h data).
+  set (ck := checksum h).
+  pose proof (sum16_app_single ws ck) as Happ. (* Happ : sum16 (ws ++ [ck]) = add16_ones (sum16 ws) (to_word16 ck) *)
+  destruct Hn as [_ [_ [_ Hck_lt]]].           (* ck < 2^16 *)
+  rewrite (to_word16_id_if_lt ck Hck_lt) in Happ.
+  (* We want add16_ones (sum16 ws) ck = mask16; use Happ and Hver via transitivity. *)
+  exact (eq_trans (eq_sym Happ) Hver).
+Qed.
+
+(* Step 2/4: if the verifier reduces to [add16_ones mask16 ck = mask16] and
+   the checksum field is nonzero, then the checksum must be 0xFFFF. *)
+Lemma add16_ones_mask16_nonzero_eq_mask16 :
+  forall ck,
+    ck < two16 ->
+    ck <> 0 ->
+    add16_ones mask16 ck = mask16 ->
+    ck = mask16.
+Proof.
+  intros ck Hlt Hnz H.
+  (* Since ck ≠ 0, we have overflow: mask16 + ck ≥ two16. *)
+  assert (Hge : two16 <= mask16 + ck) by (unfold two16, mask16 in *; lia).
+  (* In overflow, add16_ones subtracts mask16. *)
+  rewrite (add16_ones_overflow mask16 ck Hge) in H.
+  lia.
+Qed.
+
+
 
   (* Canonical re‑encoding after a successful decode (defaults, StrictEq). *)
   Theorem decode_encode_complete_defaults_canonical :
@@ -2008,7 +2027,9 @@ Qed.
            of [parse_header] (success case).  A direct algebraic proof is not
            needed here because we only require [8 + lenN data <= mask16] below,
            and that follows from [Hnorm]. *)
-        (* We avoid reconstructing [w] explicitly; it suffices that L ≥ 8. *)
+        (* We avoid reconstructing [w] expliScheme new_scheme := Induction for _ Sort _
+with _ := Induction for _ Sort _.
+citly; it suffices that L ≥ 8. *)
         assert (8 <= L) by (apply N.ltb_ge; now rewrite EL8).
         lia. }
       (* Since L < 2^16, we have 8 + lenN data <= mask16, hence [mk_header] succeeds. *)
