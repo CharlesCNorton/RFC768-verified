@@ -2613,84 +2613,328 @@ Corollary decode_encode_completeness_defaults_no_parse :
 Proof.
   intros ipS ipD w sp dp data Hdec.
   (* The decoder starts by parsing; expose that match *)
-  remember (parse_header w) as P.
-  destruct P as [(h,rest)|] eqn:Hparse; [| now (unfold decode_udp_ipv4 in Hdec; rewrite Hparse in Hdec)].
-  exists h, rest. split; [assumption|].
-  eapply decode_encode_completeness_defaults; eauto.
+  assert (Hdec_copy := Hdec).
+  unfold decode_udp_ipv4 in Hdec_copy.
+  destruct (parse_header w) as [(h,rest)|] eqn:Hparse.
+  - (* Successful parse *)
+    exists h, rest. 
+    split; [reflexivity|].
+    exact (decode_encode_completeness_defaults ipS ipD w sp dp data h rest Hdec Hparse).
+  - (* Failed parse - contradicts successful decode *)
+    discriminate Hdec_copy.
 Qed.
 
 (** ****************************************************************************
-    Status note: UDP over IPv4 (RFC 768) with selected RFC 1122 obligations
-    ----------------------------------------------------------------------------
-    Scope.
-      This development formalizes the UDP/IPv4 wire format and core processing
-      rules as in RFC 768, together with the receive‑side obligations needed
-      by applications (specific‑destination address delivery) and basic ICMP
-      advice selection as in RFC 1122 §4.1.  IPv6 is out of scope.  IP
-      fragmentation/reassembly and socket demultiplexing are assumed to be
-      provided by the IP/host environment and are not modeled here.
-
-    Summary of completed artifacts.
-      • Header layout and big‑endian serialization/deserialization with
-        normalization; parsing inverts serialization under [header_norm].
-      • Length discipline: [length16 = 8 + |payload|], lower bound 8, guards
-        on decode; encoder/decoder agree on total length.
-      • Internet checksum: one's‑complement end‑around sum over the IPv4
-        pseudo‑header, header‑with‑zero checksum, and data, with odd‑length
-        padding; associativity/closure of the arithmetic; encode→verify
-        correctness; "0 → 0xFFFF" transmission rule.
-      • Encode→Decode (left‑inverse) theorems for the default policies
-        (Reject destination‑port 0, StrictEq) and for the Allow0/AcceptShorter
-        variants; address‑carrying corollaries; ICMP advice lemmas for the
-        listener/no‑listener cases.
-      • Decode→Encode completeness (right‑inverse/canonicalization): Any wire
-        accepted by [decode_udp_ipv4 defaults_ipv4] equals the result of
-        [encode_udp_ipv4 defaults_ipv4] on the triple it returns, modulo the
-        0→0xFFFF checksum canonicalization. See [decode_encode_completeness_defaults].
-      • Executable examples exercising odd‑length payloads, default length
-        equality, and advisory outcomes.
-
-    Remaining work to reach a "full" core RFC 768 formalization here.
-      R2. AcceptShorter surplus‑octet case.
-          Extend the proofs under [AcceptShorterIP] to the case Nbytes > L,
-          showing that the decoder delivers exactly the first L−8 octets and
-          ignores any surplus supplied by IP.
-
-      R3. ICMP suppression refinements (advice interface).
-          Extend [udp_complete_icmp_advice] with minimal IP metadata
-          (e.g., link‑layer broadcast, initial‑fragment flag, source‑address
-          class) and prove the expected suppressions (no ICMP for LL
-          broadcast, non‑initial fragments, non‑unicast/invalid sources).
-
-      R4. Optional input screening of invalid sources.
-          Either state an explicit IP‑layer assumption or add a UDP‑layer
-          guard for invalid/non‑unicast sources and show that it preserves the
-          established round‑trip theorems when the premise holds.
-
-      R5. Small conformance lemmas.
-          (a) Injectivity of [udp_header_bytes] under [header_norm].
-          (b) Encoder monotonicity: [encode = Err Oversize] ⇔ [8 + lenN data > mask16].
-          (c) Verification stability under AcceptShorter (verifier depends
-              only on the L‑bounded prefix), stated as an explicit lemma.
-
-    Done‑conditions (to declare the core complete here).
-      D1. ✓ COMPLETE: A proved decoder→encoder completeness theorem for the defaults.
-      D2. A proved AcceptShorter surplus‑octet theorem (R2).
-      D3. ICMP advice extended with the suppression matrix and corresponding
-          proofs (R3).
-      D4. Conformance lemmas (R5a–c).
-
-    Required minimal examples accompanying the above.
-      E1. A concrete wire with surplus octets (Nbytes > L) that is accepted
-          under [AcceptShorterIP] and delivers exactly the prefix of length
-          L−8; a negative example showing rejection under [StrictEq].
-      E2. An example demonstrating encoder oversize rejection at the boundary
-          ([8 + lenN data = mask16 + 1]) and acceptance just below it.
-      E3. ICMP advice examples showing suppression for (i) destination
-          multicast/broadcast (already present), (ii) link‑layer broadcast,
-          and (iii) non‑initial fragments once the metadata is added.
-
-    With D1 ✓ proved, D2–D4 remaining, and E1–E3 present, the UDP/IPv4 core 
-    (RFC 768) and the exercised RFC 1122 obligations in this file can be 
-    regarded as substantially complete.
+    Conformance lemmas): injectivity, oversize monotonicity, and
+    verification stability under AcceptShorter
     **************************************************************************** *)
+
+Section UDP_R5_Conformance.
+  Open Scope N_scope.
+
+  (** * R5a. Injectivity of [udp_header_bytes] under [header_norm] *)
+
+  Lemma udp_header_bytes_inj :
+    forall h1 h2,
+      header_norm h1 -> header_norm h2 ->
+      udp_header_bytes h1 = udp_header_bytes h2 ->
+      h1 = h2.
+  Proof.
+    intros h1 h2 Hn1 Hn2 Heq.
+    pose proof (parse_header_bytes_of_header_norm h1 [] Hn1) as P1.
+    pose proof (parse_header_bytes_of_header_norm h2 [] Hn2) as P2.
+    rewrite Heq in P1.
+    rewrite P1 in P2.
+    now inversion P2.
+  Qed.
+
+  (** * R5b. Encoder monotonicity for size: oversize iff [8 + lenN data > mask16] *)
+
+Lemma encode_oversize_iff :
+  forall cfg ipS ipD sp dp data,
+    encode_udp_ipv4 cfg ipS ipD sp dp data = Err Oversize <->
+    8 + lenN data > mask16.
+Proof.
+  intros cfg ipS ipD sp dp data; split; intro H.
+  - (* -> *)
+    unfold encode_udp_ipv4 in H.
+    destruct (mk_header sp dp (lenN data)) as [h0|] eqn:Hmk; [discriminate|].
+    unfold mk_header in Hmk.
+    destruct (8 + lenN data <=? mask16) eqn:Hleb; [discriminate|].
+    (* From [leb=false], deduce strict inequality *)
+    apply N.leb_gt in Hleb. lia.
+  - (* <- *)
+    unfold encode_udp_ipv4.
+    unfold mk_header.
+    destruct (8 + lenN data <=? mask16) eqn:Hleb.
+    + apply N.leb_le in Hleb. lia.
+    + reflexivity.
+Qed.
+
+  (** * R5c. Verification stability under AcceptShorter:
+          the verifier depends only on the [L−8]-bounded prefix *)
+
+Lemma take_len_app :
+  forall (A:Type) (xs ys:list A),
+    take (List.length xs) (xs ++ ys) = xs.
+Proof.
+  intros A xs; induction xs as [|x xs IH]; intros ys; simpl.
+  - reflexivity.
+  - rewrite IH. reflexivity.
+Qed.
+
+Lemma take_lenN_app :
+  forall (A:Type) (xs ys:list A),
+    take (N.to_nat (lenN xs)) (xs ++ ys) = xs.
+Proof.
+  intros A xs ys. rewrite N_to_nat_lenN. apply take_len_app.
+Qed.
+
+Lemma verify_prefix_stability :
+  forall ipS ipD h data tail,
+    length16 h = 8 + lenN data ->
+    verify_checksum_ipv4 ipS ipD h
+      (take (N.to_nat (length16 h - 8)) (data ++ tail))
+    = verify_checksum_ipv4 ipS ipD h data.
+Proof.
+  intros ipS ipD h data tail HL.
+  rewrite HL, N_add_sub_cancel_l, N_to_nat_lenN.
+  rewrite take_len_app. reflexivity.
+Qed.
+
+  Corollary verify_prefix_stability_true :
+    forall ipS ipD h data tail,
+      length16 h = 8 + lenN data ->
+      verify_checksum_ipv4 ipS ipD h data = true ->
+      verify_checksum_ipv4 ipS ipD h
+        (take (N.to_nat (length16 h - 8)) (data ++ tail)) = true.
+  Proof.
+    intros; rewrite verify_prefix_stability by assumption; assumption.
+  Qed.
+
+End UDP_R5_Conformance.
+
+(** ****************************************************************************
+    AcceptShorter surplus‑octet case
+    ----------------------------------------------------------------------------
+    In AcceptShorterIP mode, if IP presents a UDP datagram whose payload is
+    [data ++ tail] but the UDP Length field equals [8 + |data|], then the
+    decoder accepts the datagram and delivers exactly [data], ignoring [tail].
+    Acceptance holds:
+      • unconditionally when the transmitted checksum is 0 (defaults accept 0),
+      • or when the verifier succeeds on [data] (non‑zero checksum).
+    **************************************************************************** *)
+
+Section UDP_R2_AcceptShorter_Surplus.
+  Open Scope N_scope.
+
+(** A small helper: compute the delivered slice under the hypothesis
+    [length16 h = 8 + lenN data] and [rest = data ++ tail]. *)
+Lemma delivered_eq_data_from_L :
+  forall h (data tail : list byte),
+    length16 h = 8 + lenN data ->
+    take (N.to_nat (length16 h - 8)) (data ++ tail) = data.
+Proof.
+  intros h data tail HL.
+  rewrite HL, N_add_sub_cancel_l, N_to_nat_lenN.
+  apply take_len_app.
+Qed.
+
+(** Helper: Length guards for AcceptShorter with surplus *)
+Lemma acceptShorter_length_guards :
+ forall w h data tail,
+   parse_header w = Some (h, data ++ tail) ->
+   length16 h = 8 + lenN data ->
+   (length16 h <? 8) = false /\
+   (lenN w <? length16 h) = false.
+Proof.
+ intros w h data tail Hparse HL.
+ pose proof (parse_header_shape_bytes _ _ _ Hparse) as Hw.
+ split.
+ - rewrite HL. apply N.ltb_ge. lia.
+ - rewrite Hw, lenN_app, lenN_udp_header_bytes_8, HL, lenN_app.
+   apply N.ltb_ge. lia.
+Qed.
+
+(** Main acceptance lemma for defaults with AcceptShorterIP and dp≠0. *)
+Theorem decode_acceptShorter_surplus_defaults_reject_nonzero16 :
+  forall ipS ipD w h data tail,
+    parse_header w = Some (h, data ++ tail) ->
+    N.eqb (dst_port h) 0 = false ->
+    length16 h = 8 + lenN data ->
+    ( N.eqb (checksum h) 0 = true \/
+      (N.eqb (checksum h) 0 = false /\ verify_checksum_ipv4 ipS ipD h data = true) ) ->
+    decode_udp_ipv4 defaults_ipv4_acceptShorter ipS ipD w
+      = Ok (src_port h, dst_port h, data).
+Proof.
+  intros ipS ipD w h data tail Hparse Hdp_nz HL Hck_cases.
+  
+  (* Get length guards *)
+  destruct (acceptShorter_length_guards w h data tail Hparse HL) as [EL8 ENbL].
+  
+  (* Evaluate decoder *)
+  unfold decode_udp_ipv4. rewrite Hparse.
+  change (dst_port0_policy defaults_ipv4_acceptShorter) with Reject.
+  rewrite Hdp_nz, EL8, ENbL.
+  change (length_rx_mode defaults_ipv4_acceptShorter) with AcceptShorterIP.
+  
+  destruct Hck_cases as [Hck0 | [HckNZ Hver_data]].
+  - (* checksum==0 *)
+    rewrite Hck0.
+    change (checksum_rx_mode defaults_ipv4_acceptShorter) with ValidOrZero.
+    change (zero_checksum_allowed defaults_ipv4_acceptShorter ipD) with true.
+    rewrite (delivered_eq_data_from_L h data tail HL).
+    reflexivity.
+  - (* checksum!=0 *)
+    rewrite HckNZ.
+    rewrite (delivered_eq_data_from_L h data tail HL), Hver_data.
+    reflexivity.
+Qed.
+
+(** Variant with Allow0 policy: no premise on [dst_port h]. *)
+Theorem decode_acceptShorter_surplus_defaults_allow0 :
+  forall ipS ipD w h data tail,
+    parse_header w = Some (h, data ++ tail) ->
+    length16 h = 8 + lenN data ->
+    ( N.eqb (checksum h) 0 = true \/
+      (N.eqb (checksum h) 0 = false /\ verify_checksum_ipv4 ipS ipD h data = true) ) ->
+    decode_udp_ipv4 defaults_ipv4_allow0_acceptShorter ipS ipD w
+      = Ok (src_port h, dst_port h, data).
+Proof.
+  intros ipS ipD w h data tail Hparse HL Hck_cases.
+  
+  (* Get length guards *)
+  destruct (acceptShorter_length_guards w h data tail Hparse HL) as [EL8 ENbL].
+  
+  (* Evaluate decoder *)
+  unfold decode_udp_ipv4. rewrite Hparse.
+  change (dst_port0_policy defaults_ipv4_allow0_acceptShorter) with Allow.
+  rewrite EL8, ENbL.
+  change (length_rx_mode defaults_ipv4_allow0_acceptShorter) with AcceptShorterIP.
+  
+  destruct Hck_cases as [Hck0 | [HckNZ Hver_data]].
+  - (* checksum==0 *)
+    rewrite Hck0.
+    change (checksum_rx_mode defaults_ipv4_allow0_acceptShorter) with ValidOrZero.
+    change (zero_checksum_allowed defaults_ipv4_allow0_acceptShorter ipD) with true.
+    rewrite (delivered_eq_data_from_L h data tail HL).
+    reflexivity.
+  - (* checksum!=0 *)
+    rewrite HckNZ.
+    rewrite (delivered_eq_data_from_L h data tail HL), Hver_data.
+    reflexivity.
+Qed.
+
+End UDP_R2_AcceptShorter_Surplus.
+
+(** ****************************************************************************
+    R3: Minimal ICMP suppression matrix via IP metadata (additive interface)
+    ----------------------------------------------------------------------------
+    We extend the advisory interface with a small record of IP-derived flags
+    and define a wrapper that enforces the standard suppressions before
+    delegating to [udp_complete_icmp_advice].
+    **************************************************************************** *)
+
+Section UDP_R3_ICMP_Suppression.
+  Open Scope N_scope.
+
+  (** Minimal metadata required from IP / link. *)
+  Record IPMeta := {
+    ll_broadcast     : bool;  (* link-layer broadcast frame *)
+    initial_fragment : bool;  (* true iff packet is an initial fragment *)
+    src_is_unicast   : bool   (* false for invalid/non-unicast sources *)
+  }.
+
+  (** Suppression wrapper: any suppressing condition forces [NoAdvice];
+      otherwise defer to the existing [udp_complete_icmp_advice]. *)
+  Definition udp_complete_icmp_advice_meta
+    (cfg:Config) (meta:IPMeta)
+    (has_listener: IPv4 -> word16 -> bool)
+    (src_ip dst_ip:IPv4)
+    (res: result UdpDeliver DecodeError) : RxAdvice :=
+    if negb meta.(src_is_unicast) then NoAdvice else
+    if negb meta.(initial_fragment) then NoAdvice else
+    if        meta.(ll_broadcast)   then NoAdvice else
+      udp_complete_icmp_advice cfg has_listener src_ip dst_ip res.
+
+  (** Elementary suppressions. *)
+  Lemma icmp_suppression_src_not_unicast :
+    forall cfg meta has_listener src dst res,
+      meta.(src_is_unicast) = false ->
+      udp_complete_icmp_advice_meta cfg meta has_listener src dst res = NoAdvice.
+  Proof.
+    intros; unfold udp_complete_icmp_advice_meta.
+    now rewrite H.
+  Qed.
+
+  Lemma icmp_suppression_non_initial_fragment :
+    forall cfg meta has_listener src dst res,
+      meta.(initial_fragment) = false ->
+      udp_complete_icmp_advice_meta cfg meta has_listener src dst res = NoAdvice.
+  Proof.
+    intros; unfold udp_complete_icmp_advice_meta.
+    destruct (meta.(src_is_unicast)); [now rewrite H|reflexivity].
+  Qed.
+
+  Lemma icmp_suppression_ll_broadcast :
+    forall cfg meta has_listener src dst res,
+      meta.(ll_broadcast) = true ->
+      udp_complete_icmp_advice_meta cfg meta has_listener src dst res = NoAdvice.
+  Proof.
+    intros; unfold udp_complete_icmp_advice_meta.
+    destruct (meta.(src_is_unicast)); [|reflexivity].
+    destruct (meta.(initial_fragment)); [now rewrite H|reflexivity].
+  Qed.
+
+  (** When meta says “OK to notify”, the wrapper reduces to the base advice. *)
+  Lemma icmp_meta_reduces_to_base :
+    forall cfg meta has_listener src dst res,
+      meta.(src_is_unicast) = true ->
+      meta.(initial_fragment) = true ->
+      meta.(ll_broadcast) = false ->
+      udp_complete_icmp_advice_meta cfg meta has_listener src dst res
+        = udp_complete_icmp_advice cfg has_listener src dst res.
+  Proof.
+    intros; unfold udp_complete_icmp_advice_meta.
+    now rewrite H, H0, H1.
+  Qed.
+
+  (** …and if host policy says “send ICMP”, it further reduces to [udp_rx_icmp_advice]. *)
+  Lemma icmp_meta_reduces_to_rx_when_send :
+    forall cfg meta has_listener src dst res,
+      meta.(src_is_unicast) = true ->
+      meta.(initial_fragment) = true ->
+      meta.(ll_broadcast) = false ->
+      should_send_icmp cfg dst = true ->
+      udp_complete_icmp_advice_meta cfg meta has_listener src dst res
+        = udp_rx_icmp_advice has_listener res.
+  Proof.
+    intros cfg meta has_listener src dst res Hunicast Hinit Hll Hb.
+    rewrite (icmp_meta_reduces_to_base cfg meta has_listener src dst res Hunicast Hinit Hll).
+    unfold udp_complete_icmp_advice; now rewrite Hb.
+  Qed.
+
+  (** Example corollary: port-unreachable with metadata, delegating to your existing proof. *)
+  Corollary decode_generates_port_unreachable_with_meta :
+    forall ipS ipD sp dp data wire h0 has_listener meta,
+      mk_header sp dp (lenN data) = Some h0 ->
+      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
+      decode_udp_ipv4 defaults_ipv4 ipS ipD wire
+        = Ok (to_word16 sp, to_word16 dp, data) ->
+      has_listener ipD (to_word16 dp) = false ->
+      should_send_icmp defaults_ipv4 ipD = true ->
+      meta.(src_is_unicast) = true ->
+      meta.(initial_fragment) = true ->
+      meta.(ll_broadcast) = false ->
+      udp_complete_icmp_advice_meta defaults_ipv4 meta has_listener ipS ipD
+        (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire)
+      = SendICMPDestUnreach ICMP_PORT_UNREACH.
+  Proof.
+    intros.
+    rewrite (icmp_meta_reduces_to_rx_when_send defaults_ipv4 meta has_listener ipS ipD
+              (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire)); try assumption.
+    (* Now reuse your existing theorem on udp_rx_icmp_advice. *)
+    eapply decode_generates_port_unreachable; eauto.
+  Qed.
+
+End UDP_R3_ICMP_Suppression.
