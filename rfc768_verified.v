@@ -2155,71 +2155,98 @@ Section UDP_Decode_Encode_Completeness.
   Open Scope N_scope.
 
   (** Auxiliary: round‑trip on bytes for BE16 at the byte level. *)
-  Lemma be16_of_word16_word16_of_be_id :
-    forall b0 b1,
-      is_byte b0 = true -> is_byte b1 = true ->
-      be16_of_word16 (word16_of_be b0 b1) = (b0, b1).
-  Proof.
-    intros b0 b1 Hb0 Hb1.
-    pose proof (is_byte_lt_two8 b0 Hb0) as Hb0_lt.
-    pose proof (is_byte_lt_two8 b1 Hb1) as Hb1_lt.
-    unfold be16_of_word16, word16_of_be.
-    (* Low byte: (b0*256 + b1) mod 256 = b1 *)
-    assert (Hlo : (b0 * two8 + b1) mod two8 = b1).
-    { rewrite N.add_comm.
-      rewrite N.add_mod by (unfold two8; lia).
-      rewrite N.mod_mul by (unfold two8; lia).
-      rewrite N.mod_small by exact Hb1_lt.
-      rewrite N.add_0_l.
-      rewrite N.mod_small by exact Hb1_lt.
-      reflexivity. }
-    (* High byte: ((b0*256 + b1) / 256) mod 256 = b0 *)
-    assert (Hhi : ((b0 * two8 + b1) / two8) mod two8 = b0).
-    { replace ((b0 * two8 + b1) / two8)
-        with (b0 + (b1 / two8))
-        by (rewrite N.add_comm;
-            rewrite N.add_div by (unfold two8; lia);
-            now rewrite N.mul_comm, N.mul_div_r by (unfold two8; lia)).
-      rewrite N.div_small by exact Hb1_lt.
-      rewrite N.add_0_r.
-      now rewrite N.mod_small by exact Hb0_lt. }
-    now rewrite Hhi, Hlo.
-  Qed.
+Lemma be16_of_word16_word16_of_be_id :
+ forall b0 b1,
+   is_byte b0 = true -> is_byte b1 = true ->
+   be16_of_word16 (word16_of_be b0 b1) = (b0, b1).
+Proof.
+ intros b0 b1 Hb0 Hb1.
+ pose proof (is_byte_lt_two8 _ Hb0) as Hb0_lt.
+ pose proof (is_byte_lt_two8 _ Hb1) as Hb1_lt.
+ Transparent be16_of_word16 word16_of_be.
+ unfold be16_of_word16, word16_of_be.
+ 
+ assert (two8_ne : two8 <> 0) by (unfold two8; lia).
+ 
+ (* Low octet *)
+ assert (Hlo : (b0 * two8 + b1) mod two8 = b1).
+ { rewrite N.add_mod by exact two8_ne.
+   rewrite N.mod_mul by exact two8_ne.
+   rewrite N.add_0_l.
+   rewrite N.mod_mod by exact two8_ne.
+   now rewrite N.mod_small by exact Hb1_lt. }
+ 
+ (* High octet *)
+ assert (Hdiv : (b0 * two8 + b1) / two8 = b0).
+ { rewrite N.div_add_l by exact two8_ne.
+   rewrite N.div_small by exact Hb1_lt.
+   rewrite N.add_0_r.
+   reflexivity. }
+ 
+ assert (Hhi : ((b0 * two8 + b1) / two8) mod two8 = b0).
+ { rewrite Hdiv. 
+   now rewrite N.mod_small by exact Hb0_lt. }
+ 
+ rewrite Hhi, Hlo.
+ reflexivity.
+ Opaque be16_of_word16 word16_of_be.
+Qed.
 
   (** Any successful parse reveals that the wire is exactly header‑bytes ++ rest. *)
-  Lemma parse_header_shape_bytes :
-    forall w h rest,
-      parse_header w = Some (h, rest) ->
-      w = udp_header_bytes h ++ rest.
-  Proof.
-    intros w h rest H.
-    unfold parse_header in H.
-    (* Decompose the first eight bytes of [w]. *)
-    destruct w as [|s0 w]; try discriminate.
-    destruct w as [|s1 w]; try discriminate.
-    destruct w as [|d0 w]; try discriminate.
-    destruct w as [|d1 w]; try discriminate.
-    destruct w as [|l0 w]; try discriminate.
-    destruct w as [|l1 w]; try discriminate.
-    destruct w as [|c0 w]; try discriminate.
-    destruct w as [|c1 rest0]; try discriminate.
-    cbn in H.
-    set (header8 := [s0; s1; d0; d1; l0; l1; c0; c1]).
-    destruct (forallb is_byte header8) eqn:Hall; try discriminate.
-    inversion H; subst h rest; clear H.
+Lemma parse_header_shape_bytes :
+  forall w h rest,
+    parse_header w = Some (h, rest) ->
+    w = udp_header_bytes h ++ rest.
+Proof.
+  intros w h rest H.
+  unfold parse_header in H.
+  (* Decompose the first eight bytes of [w]. *)
+  destruct w as [|s0 w]; try discriminate.
+  destruct w as [|s1 w]; try discriminate.
+  destruct w as [|d0 w]; try discriminate.
+  destruct w as [|d1 w]; try discriminate.
+  destruct w as [|l0 w]; try discriminate.
+  destruct w as [|l1 w]; try discriminate.
+  destruct w as [|c0 w]; try discriminate.
+  destruct w as [|c1 rest0]; try discriminate.
+  cbn in H.
+  set (header8 := [s0; s1; d0; d1; l0; l1; c0; c1]).
+  destruct (forallb is_byte header8) eqn:Hall.
+  - (* Case: Hall = true *)
+    unfold header8 in Hall.
+    simpl in Hall.
+    rewrite Hall in H.
+    simpl in H.
+    inversion H; subst h rest0; clear H.
     (* Extract byte‑range facts from [Hall]. *)
     cbn in Hall.
     repeat (apply Bool.andb_true_iff in Hall as [? Hall]).
     (* Equality of the first 8 bytes with [udp_header_bytes h]. *)
     unfold udp_header_bytes, udp_header_words; cbn.
-    rewrite !to_word16_id_if_lt
-      by (eapply word16_of_be_lt_two16_of_is_byte; eauto).
+    Transparent bytes_of_words16_be to_word16.
+    simpl.
+    (* Need to show to_word16 doesn't change values already < two16 *)
+    assert (Hs: word16_of_be s0 s1 < two16) by (apply word16_of_be_lt_two16_of_is_byte; auto).
+    assert (Hd: word16_of_be d0 d1 < two16) by (apply word16_of_be_lt_two16_of_is_byte; auto).
+    assert (Hl: word16_of_be l0 l1 < two16) by (apply word16_of_be_lt_two16_of_is_byte; auto).
+    assert (Hc: word16_of_be c0 c1 < two16) by (apply word16_of_be_lt_two16_of_is_byte; auto).
+    rewrite (to_word16_id_if_lt _ Hs).
+    rewrite (to_word16_id_if_lt _ Hd).
+    rewrite (to_word16_id_if_lt _ Hl).
+    rewrite (to_word16_id_if_lt _ Hc).
     rewrite (be16_of_word16_word16_of_be_id s0 s1); try assumption.
     rewrite (be16_of_word16_word16_of_be_id d0 d1); try assumption.
     rewrite (be16_of_word16_word16_of_be_id l0 l1); try assumption.
     rewrite (be16_of_word16_word16_of_be_id c0 c1); try assumption.
     reflexivity.
-  Qed.
+  - (* Case: Hall = false *)
+    unfold header8 in Hall.
+    simpl in Hall.
+    rewrite Hall in H.
+    simpl in H.
+    discriminate H.
+  Opaque bytes_of_words16_be to_word16.
+Qed.
 
   (** Decoder→Encoder completeness for defaults (StrictEq), non‑zero checksum on wire. *)
   Theorem decode_encode_completeness_defaults_nonzero_ck :
