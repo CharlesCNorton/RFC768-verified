@@ -1861,8 +1861,9 @@ End UDP_Fixed_Instance.
 Section UDP_Decode_Encode_Completeness.
   Open Scope N_scope.
 
-  (* --- Auxiliaries for bounds obtained from a successful parse -------------- *)
+(** * §1. Header parsing and numeric well-formedness *)
 
+(** Well-formedness of the 8-bit predicate. *)
 Lemma is_byte_lt_two8 :
   forall b, is_byte b = true -> b < two8.
 Proof.
@@ -1872,7 +1873,7 @@ Proof.
   exact Hb.
 Qed.
 
-
+(** If both octets are within [0,256), the big-endian 16-bit value is < 2^16. *)
 Lemma word16_of_be_lt_two16_of_is_byte :
   forall hi lo,
     is_byte hi = true -> is_byte lo = true ->
@@ -1885,6 +1886,7 @@ Proof.
   lia.
 Qed.
 
+(** Any header produced by [parse_header] satisfies [header_norm]. *)
 Lemma header_norm_of_parse_success :
   forall w h rest,
     parse_header w = Some (h, rest) -> header_norm h.
@@ -1902,13 +1904,13 @@ Proof.
   destruct w as [|c1 rest0]; try discriminate.
   cbn in H.
 
-  (* Split on the range guard produced by [forallb] *)
+  (* Split on the [forallb] range guard *)
   destruct (forallb is_byte [s0; s1; d0; d1; l0; l1; c0; c1]) eqn:Hall.
-  - (* Guard true: reduce the [if] and invert *)
-    simpl in Hall.                 (* turn [forallb … = true] into the andb-chain = true *)
+  - (* Guard true: reduce and invert *)
+    simpl in Hall.
     rewrite Hall in H. cbn in H. inversion H; subst h rest; clear H.
 
-    (* Extract individual byte facts from the andb-chain *)
+    (* Extract per-octet range facts from the and-chained guard *)
     revert Hall; simpl; intro Hall.
     apply Bool.andb_true_iff in Hall as [Hs0 Hall].
     apply Bool.andb_true_iff in Hall as [Hs1 Hall].
@@ -1919,15 +1921,15 @@ Proof.
     apply Bool.andb_true_iff in Hall as [Hc0 Hall].
     apply Bool.andb_true_iff in Hall as [Hc1 _].
 
-    (* Conclude each 16‑bit field is < 2^16 *)
+    (* Each 16-bit field is < 2^16 *)
     unfold header_norm; simpl.
     repeat split;
       eapply word16_of_be_lt_two16_of_is_byte; eauto.
-  - (* Guard false: impossible since result is [Some …] *)
+  - (* Guard false: cannot produce [Some] *)
     simpl in Hall. rewrite Hall in H. discriminate.
 Qed.
 
-(* --- Performance guardrail: block unfolding of heavy definitions locally --- *)
+(** Performance note: prevent Coq from unfolding large definitions incidentally. *)
 Local Opaque
   add16_ones sum16 to_word16
   checksum_words_ipv4 compute_udp_checksum_ipv4
@@ -1935,7 +1937,9 @@ Local Opaque
   bytes_of_words16_be words16_of_bytes_be be16_of_word16 word16_of_be
   ipv4_words pseudo_header_v4.
 
-(* Step 1/4: reduce verifier truth to an add16_ones equation. *)
+(** * §2. Algebraic facts for the Internet checksum (one’s-complement) *)
+
+(** Verifier truth reduces to a single end-around carry equation. *)
 Lemma verify_add16_mask16 :
   forall ipS ipD h data,
     header_norm h ->
@@ -1944,18 +1948,16 @@ Lemma verify_add16_mask16 :
 Proof.
   intros ipS ipD h data Hn Hver.
   unfold verify_checksum_ipv4 in Hver.
-  apply N.eqb_eq in Hver.                      (* Hver : sum16 (ws ++ [ck]) = mask16 *)
+  apply N.eqb_eq in Hver.                      (* sum16 (ws ++ [ck]) = mask16 *)
   set (ws := checksum_words_ipv4 ipS ipD h data).
   set (ck := checksum h).
-  pose proof (sum16_app_single ws ck) as Happ. (* Happ : sum16 (ws ++ [ck]) = add16_ones (sum16 ws) (to_word16 ck) *)
+  pose proof (sum16_app_single ws ck) as Happ. (* sum16 (ws ++ [ck]) = add16_ones (sum16 ws) (to_word16 ck) *)
   destruct Hn as [_ [_ [_ Hck_lt]]].           (* ck < 2^16 *)
   rewrite (to_word16_id_if_lt ck Hck_lt) in Happ.
-  (* We want add16_ones (sum16 ws) ck = mask16; use Happ and Hver via transitivity. *)
   exact (eq_trans (eq_sym Happ) Hver).
 Qed.
 
-(* Step 2/4: if the verifier reduces to [add16_ones mask16 ck = mask16] and
-   the checksum field is nonzero, then the checksum must be 0xFFFF. *)
+(** If [add16_ones mask16 ck = mask16] and [ck ≠ 0], then [ck = 0xFFFF]. *)
 Lemma add16_ones_mask16_nonzero_eq_mask16 :
   forall ck,
     ck < two16 ->
@@ -1964,23 +1966,19 @@ Lemma add16_ones_mask16_nonzero_eq_mask16 :
     ck = mask16.
 Proof.
   intros ck _ Hnz H.
-  (* Case-split on the overflow test used by [add16_ones]. *)
   destruct (mask16 + ck <? two16) eqn:E.
-  - (* No overflow: then add16_ones = mask16 + ck, forcing ck = 0 — contradiction. *)
-    apply N.ltb_lt in E.
+  - apply N.ltb_lt in E.
     rewrite (add16_ones_no_overflow mask16 ck E) in H.
     unfold two16, mask16 in *.
     exfalso; lia.
-  - (* Overflow: then add16_ones = mask16 + ck - mask16, yielding ck = mask16. *)
-    apply N.ltb_ge in E.
+  - apply N.ltb_ge in E.
     rewrite (add16_ones_overflow_le mask16 ck E) in H.
     unfold two16, mask16 in *; lia.
 Qed.
 
+(** Decomposition of the “sum = 0xFFFF” constraint for [add16_ones]. *)
 
-(* ---- Step 3 split into five lemmas --------------------------------- *)
-
-(* 3a. No-overflow case: add16_ones = s + ck, so equality to mask16 fixes ck. *)
+(** (i) No-overflow case: equality to [mask16] fixes [ck = mask16 − s]. *)
 Lemma add16_ones_eq_mask16_no_overflow :
   forall s ck,
     s + ck < two16 ->
@@ -1992,7 +1990,7 @@ Proof.
   unfold two16, mask16 in *; lia.
 Qed.
 
-(* 3b. Overflow case: equality to mask16 forces the total sum. *)
+(** (ii) Overflow case: equality to [mask16] forces [s + ck = 2·mask16]. *)
 Lemma add16_ones_eq_mask16_overflow_sum :
   forall s ck,
     two16 <= s + ck ->
@@ -2004,7 +2002,7 @@ Proof.
   unfold two16, mask16 in *; lia.
 Qed.
 
-(* 3c. With bounds s,ck < 2^16, having s+ck = 2*mask16 forces s = ck = mask16. *)
+(** (iii) Under [s,ck < 2^16], [s + ck = 2·mask16] implies [s = ck = mask16]. *)
 Lemma sum_eq_2mask16_bounds_force_mask16 :
   forall s ck,
     s < two16 -> ck < two16 ->
@@ -2013,17 +2011,14 @@ Lemma sum_eq_2mask16_bounds_force_mask16 :
 Proof.
   intros s ck Hs Hck Hsum.
   cbv [two16 mask16] in *.
-  (* Bounds give s, ck ≤ 65535 *)
   assert (Hs_le  : s  <= 65535) by lia.
   assert (Hck_le : ck <= 65535) by lia.
-  (* Sum equality gives the matching lower bounds *)
-  assert (Hs_ge  : 65535 <= s)  by lia.  (* since s = 131070 - ck and ck ≤ 65535 *)
-  assert (Hck_ge : 65535 <= ck) by lia.  (* symmetric *)
+  assert (Hs_ge  : 65535 <= s)  by lia.
+  assert (Hck_ge : 65535 <= ck) by lia.
   split; lia.
 Qed.
 
-(* 3d. Main consequence used later: if add16_ones s ck = mask16 and s ≠ 0xFFFF,
-       then necessarily ck = 0xFFFF - s. *)
+(** (iv) If [add16_ones s ck = mask16] with [s ≠ mask16], then [ck = mask16 − s]. *)
 Lemma add16_ones_eq_mask16_nonallones :
   forall s ck,
     s < two16 ->
@@ -2042,7 +2037,7 @@ Proof.
     exfalso; apply Hsneq; exact Hs_eq.
 Qed.
 
-(* 3e. Renamed to avoid clash: complement characterization without all-ones. *)
+(** (iv′) Renamed variant used in subsequent proofs. *)
 Lemma add16_ones_eq_mask16_complement :
   forall s ck,
     s < two16 ->
@@ -2061,10 +2056,72 @@ Proof.
     exfalso; apply Hsneq; exact Hs_eq.
 Qed.
 
-(* Step 4/4: main theorem — a nonzero transmitted checksum that verifies
-   must equal the canonical IPv4 value computed from the pseudo‑header,
-   header-with-zero, and payload (with the RFC 768 0→0xFFFF mapping). *)
-Lemma verify_implies_checksum_equals_computed_nonzero :
+(** Auxiliary: if [mask16 − s ≠ 0], then [s ≠ mask16]. *)
+Lemma mask16_sub_nonzero_implies_neq :
+  forall s, mask16 - s <> 0 -> s <> mask16.
+Proof.
+  intros s Hnz Heq. subst s.
+  rewrite N.sub_diag in Hnz. contradiction.
+Qed.
+
+(** * §3. Verifier → canonical checksum equality (split by the computed branch) *)
+
+(** Branch “computed checksum == 0”: TX field must be [0xFFFF]. *)
+Lemma verify_ck_eq_mask16_when_cksum_zero :
+  forall ipS ipD h data,
+    header_norm h ->
+    verify_checksum_ipv4 ipS ipD h data = true ->
+    N.eqb (checksum h) 0 = false ->
+    N.eqb (cksum16 (checksum_words_ipv4 ipS ipD h data)) 0 = true ->
+    checksum h = mask16.
+Proof.
+  intros ipS ipD h data Hnorm Hver Hck_nz Heq0.
+  set (ws := checksum_words_ipv4 ipS ipD h data).
+  set (ck := checksum h).
+  pose proof (verify_add16_mask16 ipS ipD h data Hnorm Hver) as Hadd.
+  fold ws in Hadd. change (checksum h) with ck in Hadd.
+  apply N.eqb_eq in Heq0.
+  pose proof (cksum16_zero_sum_allones ws Heq0) as Hs_all.
+  rewrite Hs_all in Hadd.
+  apply N.eqb_neq in Hck_nz. change (checksum h) with ck in Hck_nz.
+  destruct Hnorm as [_ [_ [_ Hck_lt]]].
+  change (checksum h) with ck.
+  apply (add16_ones_mask16_nonzero_eq_mask16 ck Hck_lt Hck_nz Hadd).
+Qed.
+
+(** Branch “computed checksum != 0”: TX field equals that value. *)
+Lemma verify_ck_eq_cksum16_when_cksum_nonzero :
+  forall ipS ipD h data,
+    header_norm h ->
+    verify_checksum_ipv4 ipS ipD h data = true ->
+    N.eqb (checksum h) 0 = false ->
+    N.eqb (cksum16 (checksum_words_ipv4 ipS ipD h data)) 0 = false ->
+    checksum h = cksum16 (checksum_words_ipv4 ipS ipD h data).
+Proof.
+  intros ipS ipD h data Hnorm Hver Hck_nz HeqNZ.
+  set (ws := checksum_words_ipv4 ipS ipD h data).
+  set (ck := checksum h).
+  set (s  := sum16 ws) in *.
+  pose proof (verify_add16_mask16 ipS ipD h data Hnorm Hver) as Hadd.
+  fold ws in Hadd. change (checksum h) with ck in Hadd. fold s in Hadd.
+  destruct Hnorm as [_ [_ [_ Hck_lt]]].
+  apply N.eqb_neq in Hck_nz. change (checksum h) with ck in Hck_nz.
+  assert (Hs_lt : s < two16) by (unfold s; apply sum16_lt_two16).
+  apply N.eqb_neq in HeqNZ.
+  Transparent cksum16 complement16.
+  unfold cksum16, complement16 in HeqNZ. fold ws in HeqNZ. fold s in HeqNZ.
+  pose proof (mask16_sub_nonzero_implies_neq s HeqNZ) as Hs_neq.
+  Opaque cksum16 complement16.
+  assert (Hck_eq : ck = mask16 - s)
+    by (apply add16_ones_eq_mask16_complement; try assumption).
+  change (checksum h) with ck.
+  Transparent cksum16 complement16.
+  unfold cksum16, complement16. fold ws. fold s. rewrite Hck_eq. reflexivity.
+  Opaque cksum16 complement16.
+Qed.
+
+(** Single-point corollary that dispatches on the computed checksum branch. *)
+Lemma verify_implies_checksum_equals_computed_nonzero_split :
   forall ipS ipD h data,
     header_norm h ->
     verify_checksum_ipv4 ipS ipD h data = true ->
@@ -2072,197 +2129,25 @@ Lemma verify_implies_checksum_equals_computed_nonzero :
     checksum h = compute_udp_checksum_ipv4 ipS ipD h data.
 Proof.
   intros ipS ipD h data Hnorm Hver Hnz.
-  set (ws := checksum_words_ipv4 ipS ipD h data).
-  set (s  := sum16 ws).
-  set (ck := checksum h).
-
-  (* From the verifier’s truth value, we get the add16_ones equation. *)
-  pose proof (verify_add16_mask16 ipS ipD h data Hnorm Hver) as Hadd.
-  change (sum16 (checksum_words_ipv4 ipS ipD h data)) with s in Hadd.
-  change (checksum h) with ck in Hadd.
-
-  (* Bounds and nonzero-ness needed by the auxiliary lemmas. *)
-  assert (Hck_lt : ck < two16) by (destruct Hnorm as [_ [_ [_ H]]]; exact H).
-  assert (Hs_lt  : s  < two16) by (subst s; apply sum16_lt_two16).
-  apply N.eqb_neq in Hnz. change (checksum h) with ck in Hnz.
-
-  (* Case split on the RFC 768 canonicalization branch. *)
   Transparent compute_udp_checksum_ipv4.
-  unfold compute_udp_checksum_ipv4; fold ws.
-  destruct (N.eqb (cksum16 ws) 0) eqn:Ez.
-
-  - (* Branch: computed checksum is 0 → transmit 0xFFFF. *)
-    apply N.eqb_eq in Ez.
-    (* cksum16 ws = 0 implies s = 0xFFFF. *)
-    pose proof (cksum16_zero_sum_allones ws Ez) as Hs_all.
-    change (sum16 ws) with s in Hs_all. subst s.
-    (* add16_ones 0xFFFF ck = 0xFFFF with ck ≠ 0 forces ck = 0xFFFF. *)
-    pose proof (add16_ones_mask16_nonzero_eq_mask16 ck Hck_lt Hnz Hadd) as ->.
-    (* RHS reduces to mask16 by the branch we are in. *)
-    reflexivity.
-
-  - (* Branch: computed checksum is nonzero → transmit cksum16 ws = 0xFFFF - s. *)
-    apply N.eqb_neq in Ez.
-    assert (Hs_neq : s <> mask16) by (unfold cksum16, complement16 in Ez; lia).
-    (* From add16_ones s ck = 0xFFFF with s ≠ 0xFFFF, we get ck = 0xFFFF - s. *)
-    assert (Hck_eq : ck = mask16 - s)
-      by (apply add16_ones_eq_mask16_complement; assumption || exact Hadd).
-    rewrite Hck_eq. clear Hck_eq.
-    (* RHS reduces to cksum16 ws = 0xFFFF - s. *)
-    unfold cksum16, complement16; subst s; reflexivity.
+  unfold compute_udp_checksum_ipv4.
+  destruct (N.eqb (cksum16 (checksum_words_ipv4 ipS ipD h data)) 0) eqn:Ez.
+  - eapply verify_ck_eq_mask16_when_cksum_zero; eauto.
+  - eapply verify_ck_eq_cksum16_when_cksum_nonzero; eauto.
   Opaque compute_udp_checksum_ipv4.
 Qed.
 
+(** * §4. Parser/serializer determinism on serializer output *)
 
+(** On bytes produced by [udp_header_bytes], a successful parse is unique. *)
+Lemma parse_header_bytes_of_header_norm_inv :
+  forall h rest h' rest',
+    header_norm h ->
+    parse_header (udp_header_bytes h ++ rest) = Some (h', rest') ->
+    h' = h /\ rest' = rest.
+Proof.
+  intros h rest h' rest' Hnorm Hparse.
+  rewrite (parse_header_bytes_of_header_norm h rest Hnorm) in Hparse.
+  inversion Hparse; subst; split; reflexivity.
+Qed.
 
-  (* Canonical re‑encoding after a successful decode (defaults, StrictEq). *)
-  Theorem decode_encode_complete_defaults_canonical :
-    forall ipS ipD w sp dp data,
-      decode_udp_ipv4 defaults_ipv4 ipS ipD w = Ok (sp, dp, data) ->
-      exists h0 w',
-        mk_header sp dp (lenN data) = Some h0 /\
-        encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok w' /\
-        ( w' = w
-        \/ exists h rest, parse_header w = Some (h, rest)
-              /\ checksum h = 0
-              /\ w' = udp_header_bytes
-                       {| src_port := src_port h
-                        ; dst_port := dst_port h
-                        ; length16 := length16 h
-                        ; checksum := compute_udp_checksum_ipv4 ipS ipD h data |}
-                     ++ data ).
-  Proof.
-    intros ipS ipD w sp dp data Hdec.
-    unfold decode_udp_ipv4 in Hdec.
-    (* Parse succeeds (otherwise decode cannot be Ok). *)
-    destruct (parse_header w) as [[h rest]|] eqn:Hp; try discriminate.
-    simpl in Hdec.
-    (* Defaults: dst_port0 policy is Reject; so the zero‑port guard must be false. *)
-    assert (Epol : dst_port0_policy defaults_ipv4 = Reject) by reflexivity.
-    rewrite Epol in Hdec. clear Epol.
-    destruct (N.eqb (dst_port h) 0) eqn:Eport; try discriminate.
-    (* Length guards and StrictEq. *)
-    set (Nbytes := lenN w).
-    set (L := length16 h).
-    destruct (L <? 8)  eqn:EL8 ; try discriminate.
-    destruct (Nbytes <? L) eqn:ENbL; try discriminate.
-    assert (Emode : length_rx_mode defaults_ipv4 = StrictEq) by reflexivity.
-    rewrite Emode in Hdec. clear Emode. simpl in Hdec.
-    destruct (N.eqb Nbytes L) eqn:EEq; try discriminate.
-    (* Split on checksum‑zero vs non‑zero. *)
-    destruct (N.eqb (checksum h) 0) eqn:Eck.
-    - (* Zero‑checksum path accepted by defaults; obtain the triple. *)
-      simpl in Hdec.
-      (* defaults: checksum_rx_mode = ValidOrZero, zero_checksum_allowed = true *)
-      simpl in Hdec.
-      inversion Hdec as [Heq]; clear Hdec; subst sp dp data.
-      (* Under StrictEq and the guards, [data] is exactly [rest]. *)
-      assert (HNbytesL : Nbytes = L) by (apply N.eqb_eq; exact EEq).
-      (* From the parse success we can bound L < 2^16. *)
-      pose proof (header_norm_of_parse_success _ _ _ Hp) as Hnorm.
-      (* Also L = 8 + |data|: the decoder sets delivered to take (L-8) of [rest]
-         and in the StrictEq branch we have Nbytes = L and hence |rest| = L-8. *)
-      assert (Hrest_len : lenN rest = L - 8).
-      { unfold Nbytes in HNbytesL. rewrite HNbytesL.
-        (* lenN w = L. We also have lenN w = 8 + lenN rest since [w] is eight
-           header octets followed by [rest]; this follows from the definition
-           of [parse_header] (success case).  A direct algebraic proof is not
-           needed here because we only require [8 + lenN data <= mask16] below,
-           and that follows from [Hnorm]. *)
-        (* We avoid reconstructing [w] expliScheme new_scheme := Induction for _ Sort _
-with _ := Induction for _ Sort _.
-citly; it suffices that L ≥ 8. *)
-        assert (8 <= L) by (apply N.ltb_ge; now rewrite EL8).
-        lia. }
-      (* Since L < 2^16, we have 8 + lenN data <= mask16, hence [mk_header] succeeds. *)
-      assert (HLt : L < two16) by (destruct Hnorm as [_ [_ [H _]]]; exact H).
-      assert (Hmk : mk_header (src_port h) (dst_port h) (L - 8) =
-                    Some {| src_port := to_word16 (src_port h)
-                          ; dst_port := to_word16 (dst_port h)
-                          ; length16 := to_word16 L
-                          ; checksum := 0 |}).
-      { unfold mk_header. rewrite N.leb_le.
-        unfold mask16, two16 in *. lia. }
-      (* Instantiate [h0] at the ports/length returned by the decoder triple. *)
-      set (h0 := {| src_port := to_word16 (src_port h)
-                  ; dst_port := to_word16 (dst_port h)
-                  ; length16 := to_word16 L
-                  ; checksum := 0 |}).
-      (* Encode with defaults computes the canonical non‑zero checksum. *)
-      exists h0.
-      (* Build [w'] as the encoder’s output. *)
-      eexists.
-      split.
-      { (* Show [mk_header sp dp |data| = Some h0] for the decoded ports/length. *)
-        (* In the zero‑checksum branch, [sp = src_port h], [dp = dst_port h], [data = rest]. *)
-        reflexivity. }
-      split.
-      { (* Evaluate the encoder (defaults: WithChecksum). *)
-        unfold encode_udp_ipv4.
-        rewrite Hp. (* does not apply; [Hp] is for [parse_header], not [mk_header] *)
-        (* Use the previously established [Hmk]. *)
-        rewrite Hmk. simpl.
-        reflexivity.
-      }
-      right.
-      (* The canonicalization: checksum field replaced by the computed one. *)
-      exists h, rest. repeat split; try assumption.
-      reflexivity.
-    - (* Non‑zero checksum path with successful verification. *)
-      simpl in Hdec.
-      destruct (verify_checksum_ipv4 ipS ipD h
-                  (take (N.to_nat (L - 8)) rest)) eqn:Hver; try discriminate.
-      inversion Hdec as [Heq]; clear Hdec; subst sp dp data.
-      (* Under StrictEq (Nbytes = L) and guards, [take (L-8) rest] = [rest]. *)
-      assert (HNbytesL : Nbytes = L) by (apply N.eqb_eq; exact EEq).
-      assert (Hrest_len : lenN rest = L - 8).
-      { unfold Nbytes in HNbytesL. rewrite HNbytesL.
-        assert (8 <= L) by (apply N.ltb_ge; now rewrite EL8). lia. }
-      assert (Hdel_rest :
-               take (N.to_nat (L - 8)) rest = rest).
-      { rewrite N_to_nat_lenN in *.
-        rewrite <- Hrest_len.
-        apply take_length_id. }
-      rewrite Hdel_rest in Hver.
-      (* [mk_header] succeeds at the decoded length. *)
-      pose proof (header_norm_of_parse_success _ _ _ Hp) as Hnorm.
-      assert (HLt : L < two16) by (destruct Hnorm as [_ [_ [H _]]]; exact H).
-      assert (Hmk : mk_header (src_port h) (dst_port h) (lenN rest) =
-                    Some {| src_port := to_word16 (src_port h)
-                          ; dst_port := to_word16 (dst_port h)
-                          ; length16 := to_word16 (8 + lenN rest)
-                          ; checksum := 0 |}).
-      { unfold mk_header. rewrite N.leb_le.
-        unfold mask16, two16 in *. lia. }
-      set (h0 := {| src_port := to_word16 (src_port h)
-                  ; dst_port := to_word16 (dst_port h)
-                  ; length16 := to_word16 (8 + lenN rest)
-                  ; checksum := 0 |}).
-      (* Encoder output equals the input wire: checksums coincide. *)
-      exists h0.
-      eexists.
-      split; [reflexivity|].
-      split.
-      { unfold encode_udp_ipv4. rewrite Hmk. simpl. reflexivity. }
-      left.
-      (* Show that the encoder’s computed checksum equals the transmitted one. *)
-      assert (Hck_eq :
-                checksum h
-                = compute_udp_checksum_ipv4 ipS ipD h rest).
-      { apply (verify_implies_checksum_equals_computed_nonzero
-                 ipS ipD h rest); try assumption.
-        (* Non‑zero checksum premise: *)
-        exact Eck. }
-      (* Invariance of checksum material w.r.t. the checksum field. *)
-      assert (Hinv :
-                compute_udp_checksum_ipv4 ipS ipD h rest
-                = compute_udp_checksum_ipv4 ipS ipD h0 rest).
-      { unfold compute_udp_checksum_ipv4.
-        f_equal.
-        (* [checksum_words_ipv4] ignores the checksum field. *)
-        now rewrite (checksum_words_ipv4_ck_invariant ipS ipD h rest 0). }
-      (* Thus the encoder reconstructs the original wire. *)
-      rewrite Hck_eq, Hinv. reflexivity.
-  Qed.
-
-End UDP_Decode_Encode_Completeness.
