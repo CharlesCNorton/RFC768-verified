@@ -2914,27 +2914,129 @@ Section UDP_R3_ICMP_Suppression.
     unfold udp_complete_icmp_advice; now rewrite Hb.
   Qed.
 
-  (** Example corollary: port-unreachable with metadata, delegating to your existing proof. *)
-  Corollary decode_generates_port_unreachable_with_meta :
-    forall ipS ipD sp dp data wire h0 has_listener meta,
-      mk_header sp dp (lenN data) = Some h0 ->
-      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
-      decode_udp_ipv4 defaults_ipv4 ipS ipD wire
-        = Ok (to_word16 sp, to_word16 dp, data) ->
-      has_listener ipD (to_word16 dp) = false ->
-      should_send_icmp defaults_ipv4 ipD = true ->
-      meta.(src_is_unicast) = true ->
-      meta.(initial_fragment) = true ->
-      meta.(ll_broadcast) = false ->
-      udp_complete_icmp_advice_meta defaults_ipv4 meta has_listener ipS ipD
-        (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire)
-      = SendICMPDestUnreach ICMP_PORT_UNREACH.
-  Proof.
-    intros.
-    rewrite (icmp_meta_reduces_to_rx_when_send defaults_ipv4 meta has_listener ipS ipD
-              (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire)); try assumption.
-    (* Now reuse your existing theorem on udp_rx_icmp_advice. *)
-    eapply decode_generates_port_unreachable; eauto.
-  Qed.
+(** Example corollary: port-unreachable with metadata, proved directly. *)
+Corollary decode_generates_port_unreachable_with_meta :
+  forall ipS ipD sp dp data wire h0 has_listener meta,
+    mk_header sp dp (lenN data) = Some h0 ->
+    encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
+    decode_udp_ipv4 defaults_ipv4 ipS ipD wire
+      = Ok (to_word16 sp, to_word16 dp, data) ->
+    has_listener ipD (to_word16 dp) = false ->
+    should_send_icmp defaults_ipv4 ipD = true ->
+    meta.(src_is_unicast) = true ->
+    meta.(initial_fragment) = true ->
+    meta.(ll_broadcast) = false ->
+    udp_complete_icmp_advice_meta defaults_ipv4 meta has_listener ipS ipD
+      (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire)
+    = SendICMPDestUnreach ICMP_PORT_UNREACH.
+Proof.
+  intros ipS ipD sp dp data wire h0 has_listener meta Hmk Henc Hdec Hnol Hsend Hun Hin Hll.
+  (* Reduce meta-wrapper to base advice under “OK to notify” conditions. *)
+  rewrite (icmp_meta_reduces_to_rx_when_send
+             defaults_ipv4 meta has_listener ipS ipD
+             (decode_udp_ipv4_with_addrs defaults_ipv4 ipS ipD wire)
+             Hun Hin Hll Hsend).
+  (* Inline the base advice on the successful decode result. *)
+  unfold udp_rx_icmp_advice, decode_udp_ipv4_with_addrs.
+  rewrite Hdec. cbn.
+  rewrite Hnol. reflexivity.
+Qed.
 
 End UDP_R3_ICMP_Suppression.
+
+(** ****************************************************************************
+    R4: Source-address screening (additive wrapper)
+    ----------------------------------------------------------------------------
+    UDP does not itself validate IP source addresses; per RFC 1122 invalid or
+    non‑unicast sources should be dropped without eliciting ICMP.  We provide a
+    thin wrapper that (i) screens by a meta flag and (ii) leaves existing proofs
+    intact.  When screening succeeds, the wrapper preserves successful decodes;
+    when it fails, the result is [None] and—via the R3 wrapper—ICMP is suppressed.
+    **************************************************************************** *)
+
+Section UDP_R4_Source_Screening.
+  Open Scope N_scope.
+
+(** Screened decode: [Some d] iff [src_is_unicast] and the base decode succeeds. *)
+Definition udp_decode_with_addrs_screened
+  (cfg:Config) (meta:IPMeta)
+  (src_ip dst_ip:IPv4) (wire:list byte) : option UdpDeliver :=
+  if meta.(src_is_unicast)
+  then match decode_udp_ipv4_with_addrs cfg src_ip dst_ip wire with
+       | inl d  => Some d
+       | inr _ => None
+       end
+  else None.
+
+  (** Screening preserves success when the source is declared unicast. *)
+  Lemma screened_preserves_success_with_addrs :
+    forall cfg meta src dst wire d,
+      meta.(src_is_unicast) = true ->
+      decode_udp_ipv4_with_addrs cfg src dst wire = Ok d ->
+      udp_decode_with_addrs_screened cfg meta src dst wire = Some d.
+  Proof.
+    intros cfg meta src dst wire d Hun Hdec.
+    unfold udp_decode_with_addrs_screened.
+    rewrite Hun, Hdec. reflexivity.
+  Qed.
+
+  (** Screening blocks delivery for non‑unicast sources. *)
+  Lemma screened_blocks_invalid_with_addrs :
+    forall cfg meta src dst wire,
+      meta.(src_is_unicast) = false ->
+      udp_decode_with_addrs_screened cfg meta src dst wire = None.
+  Proof.
+    intros cfg meta src dst wire Hnu.
+    unfold udp_decode_with_addrs_screened. now rewrite Hnu.
+  Qed.
+
+  (** ICMP suppression follows immediately from the R3 meta wrapper. *)
+  Lemma screened_no_icmp_on_invalid_source :
+    forall cfg meta has_listener src dst wire,
+      meta.(src_is_unicast) = false ->
+      udp_complete_icmp_advice_meta cfg meta has_listener src dst
+        (decode_udp_ipv4_with_addrs cfg src dst wire)
+      = NoAdvice.
+  Proof.
+    intros cfg meta has_listener src dst wire Hnu.
+    eapply icmp_suppression_src_not_unicast; exact Hnu.
+  Qed.
+
+  (** Illustration: preservation for a proven round‑trip (defaults, Reject). *)
+  Corollary screened_roundtrip_defaults_reject_nonzero16_with_addrs :
+    forall ipS ipD sp dp data wire h0 meta,
+      meta.(src_is_unicast) = true ->
+      to_word16 dp <> 0%N ->
+      mk_header sp dp (lenN data) = Some h0 ->
+      encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp data = Ok wire ->
+      udp_decode_with_addrs_screened defaults_ipv4 meta ipS ipD wire
+        = Some {| src_ip_out := ipS
+                ; dst_ip_out := ipD
+                ; src_port_out := to_word16 sp
+                ; dst_port_out := to_word16 dp
+                ; payload_out := data |}.
+  Proof.
+    intros ipS ipD sp dp data wire h0 meta Hun HdpNZ Hmk Henc.
+    eapply screened_preserves_success_with_addrs; [exact Hun|].
+    eapply decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_with_addrs; eauto.
+  Qed.
+
+  (** Illustration: preservation for Allow0 variant. *)
+  Corollary screened_roundtrip_defaults_allow0_with_addrs :
+    forall ipS ipD sp dp data wire h0 meta,
+      meta.(src_is_unicast) = true ->
+      mk_header sp dp (lenN data) = Some h0 ->
+      encode_udp_ipv4 defaults_ipv4_allow0 ipS ipD sp dp data = Ok wire ->
+      udp_decode_with_addrs_screened defaults_ipv4_allow0 meta ipS ipD wire
+        = Some {| src_ip_out := ipS
+                ; dst_ip_out := ipD
+                ; src_port_out := to_word16 sp
+                ; dst_port_out := to_word16 dp
+                ; payload_out := data |}.
+  Proof.
+    intros ipS ipD sp dp data wire h0 meta Hun Hmk Henc.
+    eapply screened_preserves_success_with_addrs; [exact Hun|].
+    eapply decode_encode_roundtrip_ipv4_defaults_allow0_with_addrs; eauto.
+  Qed.
+
+End UDP_R4_Source_Screening.
