@@ -1963,12 +1963,154 @@ Lemma add16_ones_mask16_nonzero_eq_mask16 :
     add16_ones mask16 ck = mask16 ->
     ck = mask16.
 Proof.
-  intros ck Hlt Hnz H.
-  (* Since ck ≠ 0, we have overflow: mask16 + ck ≥ two16. *)
-  assert (Hge : two16 <= mask16 + ck) by (unfold two16, mask16 in *; lia).
-  (* In overflow, add16_ones subtracts mask16. *)
-  rewrite (add16_ones_overflow mask16 ck Hge) in H.
-  lia.
+  intros ck _ Hnz H.
+  (* Case-split on the overflow test used by [add16_ones]. *)
+  destruct (mask16 + ck <? two16) eqn:E.
+  - (* No overflow: then add16_ones = mask16 + ck, forcing ck = 0 — contradiction. *)
+    apply N.ltb_lt in E.
+    rewrite (add16_ones_no_overflow mask16 ck E) in H.
+    unfold two16, mask16 in *.
+    exfalso; lia.
+  - (* Overflow: then add16_ones = mask16 + ck - mask16, yielding ck = mask16. *)
+    apply N.ltb_ge in E.
+    rewrite (add16_ones_overflow_le mask16 ck E) in H.
+    unfold two16, mask16 in *; lia.
+Qed.
+
+
+(* ---- Step 3 split into five lemmas --------------------------------- *)
+
+(* 3a. No-overflow case: add16_ones = s + ck, so equality to mask16 fixes ck. *)
+Lemma add16_ones_eq_mask16_no_overflow :
+  forall s ck,
+    s + ck < two16 ->
+    add16_ones s ck = mask16 ->
+    ck = mask16 - s.
+Proof.
+  intros s ck Hlt H.
+  rewrite (add16_ones_no_overflow s ck Hlt) in H.
+  unfold two16, mask16 in *; lia.
+Qed.
+
+(* 3b. Overflow case: equality to mask16 forces the total sum. *)
+Lemma add16_ones_eq_mask16_overflow_sum :
+  forall s ck,
+    two16 <= s + ck ->
+    add16_ones s ck = mask16 ->
+    s + ck = mask16 + mask16.
+Proof.
+  intros s ck Hge H.
+  rewrite (add16_ones_overflow_le s ck Hge) in H.
+  unfold two16, mask16 in *; lia.
+Qed.
+
+(* 3c. With bounds s,ck < 2^16, having s+ck = 2*mask16 forces s = ck = mask16. *)
+Lemma sum_eq_2mask16_bounds_force_mask16 :
+  forall s ck,
+    s < two16 -> ck < two16 ->
+    s + ck = mask16 + mask16 ->
+    s = mask16 /\ ck = mask16.
+Proof.
+  intros s ck Hs Hck Hsum.
+  cbv [two16 mask16] in *.
+  (* Bounds give s, ck ≤ 65535 *)
+  assert (Hs_le  : s  <= 65535) by lia.
+  assert (Hck_le : ck <= 65535) by lia.
+  (* Sum equality gives the matching lower bounds *)
+  assert (Hs_ge  : 65535 <= s)  by lia.  (* since s = 131070 - ck and ck ≤ 65535 *)
+  assert (Hck_ge : 65535 <= ck) by lia.  (* symmetric *)
+  split; lia.
+Qed.
+
+(* 3d. Main consequence used later: if add16_ones s ck = mask16 and s ≠ 0xFFFF,
+       then necessarily ck = 0xFFFF - s. *)
+Lemma add16_ones_eq_mask16_nonallones :
+  forall s ck,
+    s < two16 ->
+    ck < two16 ->
+    s <> mask16 ->
+    add16_ones s ck = mask16 ->
+    ck = mask16 - s.
+Proof.
+  intros s ck Hs Hck Hsneq H.
+  destruct (s + ck <? two16) eqn:E.
+  - apply N.ltb_lt in E.
+    eapply add16_ones_eq_mask16_no_overflow; eauto.
+  - apply N.ltb_ge in E.
+    pose proof (add16_ones_eq_mask16_overflow_sum s ck E H) as Hsum.
+    destruct (sum_eq_2mask16_bounds_force_mask16 s ck Hs Hck Hsum) as [Hs_eq _].
+    exfalso; apply Hsneq; exact Hs_eq.
+Qed.
+
+(* 3e. Renamed to avoid clash: complement characterization without all-ones. *)
+Lemma add16_ones_eq_mask16_complement :
+  forall s ck,
+    s < two16 ->
+    ck < two16 ->
+    s <> mask16 ->
+    add16_ones s ck = mask16 ->
+    ck = mask16 - s.
+Proof.
+  intros s ck Hs Hck Hsneq H.
+  destruct (s + ck <? two16) eqn:E.
+  - apply N.ltb_lt in E.
+    eapply add16_ones_eq_mask16_no_overflow; eauto.
+  - apply N.ltb_ge in E.
+    pose proof (add16_ones_eq_mask16_overflow_sum s ck E H) as Hsum.
+    destruct (sum_eq_2mask16_bounds_force_mask16 s ck Hs Hck Hsum) as [Hs_eq _].
+    exfalso; apply Hsneq; exact Hs_eq.
+Qed.
+
+(* Step 4/4: main theorem — a nonzero transmitted checksum that verifies
+   must equal the canonical IPv4 value computed from the pseudo‑header,
+   header-with-zero, and payload (with the RFC 768 0→0xFFFF mapping). *)
+Lemma verify_implies_checksum_equals_computed_nonzero :
+  forall ipS ipD h data,
+    header_norm h ->
+    verify_checksum_ipv4 ipS ipD h data = true ->
+    N.eqb (checksum h) 0 = false ->
+    checksum h = compute_udp_checksum_ipv4 ipS ipD h data.
+Proof.
+  intros ipS ipD h data Hnorm Hver Hnz.
+  set (ws := checksum_words_ipv4 ipS ipD h data).
+  set (s  := sum16 ws).
+  set (ck := checksum h).
+
+  (* From the verifier’s truth value, we get the add16_ones equation. *)
+  pose proof (verify_add16_mask16 ipS ipD h data Hnorm Hver) as Hadd.
+  change (sum16 (checksum_words_ipv4 ipS ipD h data)) with s in Hadd.
+  change (checksum h) with ck in Hadd.
+
+  (* Bounds and nonzero-ness needed by the auxiliary lemmas. *)
+  assert (Hck_lt : ck < two16) by (destruct Hnorm as [_ [_ [_ H]]]; exact H).
+  assert (Hs_lt  : s  < two16) by (subst s; apply sum16_lt_two16).
+  apply N.eqb_neq in Hnz. change (checksum h) with ck in Hnz.
+
+  (* Case split on the RFC 768 canonicalization branch. *)
+  Transparent compute_udp_checksum_ipv4.
+  unfold compute_udp_checksum_ipv4; fold ws.
+  destruct (N.eqb (cksum16 ws) 0) eqn:Ez.
+
+  - (* Branch: computed checksum is 0 → transmit 0xFFFF. *)
+    apply N.eqb_eq in Ez.
+    (* cksum16 ws = 0 implies s = 0xFFFF. *)
+    pose proof (cksum16_zero_sum_allones ws Ez) as Hs_all.
+    change (sum16 ws) with s in Hs_all. subst s.
+    (* add16_ones 0xFFFF ck = 0xFFFF with ck ≠ 0 forces ck = 0xFFFF. *)
+    pose proof (add16_ones_mask16_nonzero_eq_mask16 ck Hck_lt Hnz Hadd) as ->.
+    (* RHS reduces to mask16 by the branch we are in. *)
+    reflexivity.
+
+  - (* Branch: computed checksum is nonzero → transmit cksum16 ws = 0xFFFF - s. *)
+    apply N.eqb_neq in Ez.
+    assert (Hs_neq : s <> mask16) by (unfold cksum16, complement16 in Ez; lia).
+    (* From add16_ones s ck = 0xFFFF with s ≠ 0xFFFF, we get ck = 0xFFFF - s. *)
+    assert (Hck_eq : ck = mask16 - s)
+      by (apply add16_ones_eq_mask16_complement; assumption || exact Hadd).
+    rewrite Hck_eq. clear Hck_eq.
+    (* RHS reduces to cksum16 ws = 0xFFFF - s. *)
+    unfold cksum16, complement16; subst s; reflexivity.
+  Opaque compute_udp_checksum_ipv4.
 Qed.
 
 
