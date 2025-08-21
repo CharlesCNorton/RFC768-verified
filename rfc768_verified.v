@@ -3109,3 +3109,197 @@ Section UDP_R4_Source_Screening.
   Qed.
 
 End UDP_R4_Source_Screening.
+
+(* ----------------------------------------------------------------------------
+   Required examples (E1–E3): surplus handling, oversize boundary, ICMP suppression
+   --------------------------------------------------------------------------*)
+
+Section UDP_Required_Examples.
+  Open Scope N_scope.
+
+  (** E1. Surplus-octet behavior: accepted under AcceptShorter, rejected under StrictEq. *)
+
+  Definition tail2 : list byte := [0; 0].
+
+(* Positive case (AcceptShorter): appending surplus octets is accepted and the
+   delivered payload equals the first L−8 octets (here, the original payload). *)
+Example EX_surplus_acceptShorter :
+  exists w,
+    let w' := w ++ tail2 in
+    decode_udp_ipv4 defaults_ipv4_acceptShorter ex_src ex_dst w'
+      = Ok (to_word16 ex_sp, to_word16 ex_dp, ex_payload).
+Proof.
+  destruct ex_encode_ok as [w Hw]. exists w. cbv zeta.
+
+  (* Extract mk_header success and define the header used by the encoder. *)
+  assert (Hmk : exists h0, mk_header ex_sp ex_dp (lenN ex_payload) = Some h0).
+  { unfold encode_udp_ipv4 in Hw.
+    destruct (mk_header ex_sp ex_dp (lenN ex_payload)) as [h0|] eqn:E; [eauto|discriminate]. }
+  destruct Hmk as [h0 Hmk].
+
+  set (h1 :=
+    {| src_port := src_port h0
+     ; dst_port := dst_port h0
+     ; length16 := length16 h0
+     ; checksum := compute_udp_checksum_ipv4 ex_src ex_dst h0 ex_payload |}).
+
+  (* Encoder wire shape. *)
+  unfold encode_udp_ipv4 in Hw. rewrite Hmk in Hw.
+  change (checksum_tx_mode defaults_ipv4) with WithChecksum in Hw.
+  inversion Hw; subst w; clear Hw.
+
+  (* Parsed headers produced by the serializer are normalized. *)
+  assert (Hnorm : header_norm h1) by (eapply header_norm_encode_h1; eauto).
+
+  (* Align the goal's RHS to the lemma's (src_port h1, dst_port h1, …). *)
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp0 [Hdp0' _]]].
+  assert (Hsp1 : src_port h1 = to_word16 ex_sp) by (unfold h1; simpl; exact Hsp0).
+  assert (Hdp1 : dst_port h1 = to_word16 ex_dp) by (unfold h1; simpl; exact Hdp0').
+  rewrite <- Hsp1, <- Hdp1.
+
+  (* Apply the AcceptShorter surplus lemma with the concrete surplus wire. *)
+  eapply decode_acceptShorter_surplus_defaults_reject_nonzero16
+    with (h := h1) (data := ex_payload) (tail := tail2).
+  - (* parse_header w = Some (h1, ex_payload ++ tail2) *)
+    (* w here is ((udp_header_bytes h1 ++ ex_payload) ++ tail2); reassociate. *)
+    rewrite <- app_assoc.
+    apply parse_header_bytes_of_header_norm; exact Hnorm.
+  - (* (dst_port h1 =? 0) = false *)
+    assert (Hdp_lt : ex_dp < two16) by (cbv [ex_dp two16]; lia).
+    assert (Hdp_nz : to_word16 ex_dp <> 0).
+    { intro Heq. rewrite (to_word16_id_if_lt _ Hdp_lt) in Heq.
+      cbv [ex_dp] in Heq; discriminate. }
+    apply N.eqb_neq. rewrite Hdp1. exact Hdp_nz.
+  - (* length16 h1 = 8 + |ex_payload| *)
+    eapply length16_h1_total_len; [exact Hmk|reflexivity].
+  - (* checksum case: non-zero on TX and verifier holds on the prefix *)
+    right. split.
+    + unfold h1; simpl. apply N.eqb_neq, compute_udp_checksum_ipv4_nonzero.
+    + pose proof (verify_checksum_ipv4_encode_ok
+                    ex_src ex_dst ex_sp ex_dp ex_payload h0 h1 Hmk eq_refl) as Hver.
+      exact Hver.
+Qed.
+
+(* Negative case (StrictEq): a surplus tail is rejected with BadLength. *)
+Example EX_surplus_rejected_StrictEq :
+  exists w,
+    decode_udp_ipv4 defaults_ipv4 ex_src ex_dst (w ++ tail2) = Err BadLength.
+Proof.
+  destruct ex_encode_ok as [w Hw]. exists w.
+  (* Recover mk_header success and the header used by the encoder. *)
+  assert (Hmk : exists h0, mk_header ex_sp ex_dp (lenN ex_payload) = Some h0).
+  { unfold encode_udp_ipv4 in Hw.
+    destruct (mk_header ex_sp ex_dp (lenN ex_payload)) as [h0|] eqn:E; [eauto|discriminate]. }
+  destruct Hmk as [h0 Hmk].
+  set (h1 :=
+    {| src_port := src_port h0
+     ; dst_port := dst_port h0
+     ; length16 := length16 h0
+     ; checksum := compute_udp_checksum_ipv4 ex_src ex_dst h0 ex_payload |}).
+  (* Encoder wire shape *)
+  unfold encode_udp_ipv4 in Hw. rewrite Hmk in Hw.
+  change (checksum_tx_mode defaults_ipv4) with WithChecksum in Hw.
+  inversion Hw; subst w; clear Hw.
+  (* Decode defaults (StrictEq) on surplus wire *)
+  unfold decode_udp_ipv4.
+  (* Parse step on serializer output with surplus tail *)
+  assert (Hnorm : header_norm h1) by (eapply header_norm_encode_h1; eauto).
+  fold h1.
+  rewrite <- app_assoc.
+  rewrite (parse_header_bytes_of_header_norm h1 (ex_payload ++ tail2) Hnorm).
+  (* Port-zero policy = Reject, and destination port is non-zero *)
+  change (dst_port0_policy defaults_ipv4) with Reject.
+  assert (Hdp0 : (dst_port h1 =? 0) = false).
+  { destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [Hdp _]]].
+    unfold h1; simpl. rewrite Hdp.
+    change (to_word16 ex_dp =? 0) with ((ex_dp mod two16) =? 0).
+    cbv [ex_dp two16]. reflexivity. }
+  rewrite Hdp0.
+  (* Length bookkeeping *)
+  set (Nbytes := lenN (udp_header_bytes h1 ++ ex_payload ++ tail2)).
+  set (L := length16 h1).
+  assert (HL : L = 8 + lenN ex_payload)
+    by (eapply length16_h1_total_len; [exact Hmk|reflexivity]).
+  assert (HNbytes : Nbytes = 8 + lenN ex_payload + lenN tail2).
+  { subst Nbytes.
+    rewrite lenN_app, lenN_udp_header_bytes_8, lenN_app. lia. }
+  assert (EL8  : (L <? 8) = false)     by (rewrite HL; apply N.ltb_ge; lia).
+  assert (ENbL : (Nbytes <? L) = false) by (rewrite HL, HNbytes; apply N.ltb_ge; lia).
+  rewrite EL8, ENbL.
+  (* StrictEq mode and inequality Nbytes ≠ L *)
+  change (length_rx_mode defaults_ipv4) with StrictEq.
+assert (EEq : (Nbytes =? L) = false).
+{ rewrite HL, HNbytes. apply N.eqb_neq.
+  assert (lenN tail2 > 0).
+  { cbv [tail2 lenN]. simpl. lia. }
+  lia. }
+  rewrite EEq. reflexivity.
+  Qed.
+
+  (** E2. Oversize boundary: rejection just above the limit; acceptance at the limit. *)
+
+  Definition bytes_n (n:N) : list byte := List.repeat 0%N (N.to_nat n).
+
+Lemma lenN_bytes_n : forall n, lenN (bytes_n n) = n.
+Proof.
+  intro n. unfold bytes_n, lenN.
+  rewrite repeat_length.
+  rewrite N2Nat.id. reflexivity.
+Qed.
+
+  Definition n_over  : N := mask16 - 7.  (* 8 + n_over = mask16 + 1 *)
+  Definition n_limit : N := mask16 - 8.  (* 8 + n_limit = mask16 *)
+
+  Example EX_encode_oversize_at_boundary :
+    forall cfg ipS ipD sp dp,
+      encode_udp_ipv4 cfg ipS ipD sp dp (bytes_n n_over) = Err Oversize.
+  Proof.
+    intros. rewrite encode_oversize_iff, lenN_bytes_n.
+    cbv [n_over]. lia.
+  Qed.
+
+Example EX_encode_accepts_at_limit :
+  forall cfg ipS ipD sp dp,
+    exists w, encode_udp_ipv4 cfg ipS ipD sp dp (bytes_n n_limit) = Ok w.
+Proof.
+  intros. destruct (encode_udp_ipv4 cfg ipS ipD sp dp (bytes_n n_limit)) eqn:E.
+  - eauto.
+  - destruct e.
+    + rewrite encode_oversize_iff in E. rewrite lenN_bytes_n in E.
+      cbv [n_limit] in E.
+      exfalso.
+      assert (8 + (mask16 - 8) = mask16).
+      { unfold mask16. simpl. reflexivity. }
+      rewrite H in E.
+      unfold N.gt in E.
+      rewrite N.compare_refl in E. discriminate.
+Qed.
+
+  (** E3. ICMP suppression via metadata: LL broadcast, non-initial fragment, invalid source. *)
+
+  Example EX_icmp_suppress_ll_broadcast_any :
+    forall res,
+      udp_complete_icmp_advice_meta defaults_ipv4
+        {| ll_broadcast := true; initial_fragment := true; src_is_unicast := true |}
+        (fun _ _ => false) ex_src ex_dst res
+      = NoAdvice.
+  Proof. intros res. apply icmp_suppression_ll_broadcast. reflexivity. Qed.
+
+  Example EX_icmp_suppress_non_initial_fragment_any :
+    forall res,
+      udp_complete_icmp_advice_meta defaults_ipv4
+        {| ll_broadcast := false; initial_fragment := false; src_is_unicast := true |}
+        (fun _ _ => false) ex_src ex_dst res
+      = NoAdvice.
+  Proof. intros res. apply icmp_suppression_non_initial_fragment. reflexivity. Qed.
+
+  Example EX_icmp_suppress_invalid_source_any :
+    forall res,
+      udp_complete_icmp_advice_meta defaults_ipv4
+        {| ll_broadcast := false; initial_fragment := true; src_is_unicast := false |}
+        (fun _ _ => false) ex_src ex_dst res
+      = NoAdvice.
+  Proof. intros res. apply icmp_suppression_src_not_unicast. reflexivity. Qed.
+
+End UDP_Required_Examples.
+
