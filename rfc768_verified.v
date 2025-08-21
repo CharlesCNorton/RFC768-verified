@@ -2957,16 +2957,16 @@ End UDP_R3_ICMP_Suppression.
 Section UDP_R4_Source_Screening.
   Open Scope N_scope.
 
-(** Screened decode: [Some d] iff [src_is_unicast] and the base decode succeeds. *)
-Definition udp_decode_with_addrs_screened
-  (cfg:Config) (meta:IPMeta)
-  (src_ip dst_ip:IPv4) (wire:list byte) : option UdpDeliver :=
-  if meta.(src_is_unicast)
-  then match decode_udp_ipv4_with_addrs cfg src_ip dst_ip wire with
-       | inl d  => Some d
-       | inr _ => None
-       end
-  else None.
+  (** Screened decode: [Some d] iff [src_is_unicast] and the base decode succeeds. *)
+  Definition udp_decode_with_addrs_screened
+    (cfg:Config) (meta:IPMeta)
+    (src_ip dst_ip:IPv4) (wire:list byte) : option UdpDeliver :=
+    if meta.(src_is_unicast)
+    then match decode_udp_ipv4_with_addrs cfg src_ip dst_ip wire with
+         | inl d  => Some d
+         | inr _  => None
+         end
+    else None.
 
   (** Screening preserves success when the source is declared unicast. *)
   Lemma screened_preserves_success_with_addrs :
@@ -3018,10 +3018,13 @@ Definition udp_decode_with_addrs_screened
   Proof.
     intros ipS ipD sp dp data wire h0 meta Hun HdpNZ Hmk Henc.
     eapply screened_preserves_success_with_addrs; [exact Hun|].
-    eapply decode_encode_roundtrip_ipv4_defaults_reject_nonzero16_with_addrs; eauto.
+    unfold decode_udp_ipv4_with_addrs.
+    rewrite (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16
+               ipS ipD sp dp data wire h0 HdpNZ Hmk Henc).
+    reflexivity.
   Qed.
 
-  (** Illustration: preservation for Allow0 variant. *)
+  (** Illustration: preservation for a proven round‑trip (defaults, Allow0). *)
   Corollary screened_roundtrip_defaults_allow0_with_addrs :
     forall ipS ipD sp dp data wire h0 meta,
       meta.(src_is_unicast) = true ->
@@ -3036,7 +3039,73 @@ Definition udp_decode_with_addrs_screened
   Proof.
     intros ipS ipD sp dp data wire h0 meta Hun Hmk Henc.
     eapply screened_preserves_success_with_addrs; [exact Hun|].
-    eapply decode_encode_roundtrip_ipv4_defaults_allow0_with_addrs; eauto.
+    unfold decode_udp_ipv4_with_addrs.
+
+    (* Header actually used by the encoder (WithChecksum branch). *)
+    set (h1 :=
+          {| src_port := src_port h0
+           ; dst_port := dst_port h0
+           ; length16 := length16 h0
+           ; checksum := compute_udp_checksum_ipv4 ipS ipD h0 data |}).
+
+    (* Encoder equality -> canonical wire shape. *)
+    unfold encode_udp_ipv4 in Henc.
+    rewrite Hmk in Henc.
+    change (checksum_tx_mode defaults_ipv4_allow0) with WithChecksum in Henc.
+    inversion Henc; subst wire; clear Henc.
+
+    (* Decode that known wire. *)
+    unfold decode_udp_ipv4.
+
+    (* Parsing step on header bytes from the serializer. *)
+    assert (Hnorm : header_norm h1)
+      by (eapply header_norm_encode_h1; eauto).
+    fold h1.
+    replace (parse_header (udp_header_bytes h1 ++ data))
+      with (Some (h1, data))
+      by (symmetry; apply parse_header_bytes_of_header_norm; exact Hnorm).
+    cbn.
+
+    (* Policy and mode.*)
+    change (dst_port0_policy defaults_ipv4_allow0) with Allow.
+    cbn.
+
+    (* Length bookkeeping: note the branch uses [length16 h0]. *)
+    destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL0 _]]]]. (* HL0: length16 h0 = to_word16 (8 + |data|) *)
+    assert (HL0id : length16 h0 = 8 + lenN data)
+      by (rewrite HL0; now apply to_word16_id_if_le_mask).
+    assert (HNbytes : lenN (udp_header_bytes h1 ++ data) = 8 + lenN data)
+      by (apply lenN_wire_from_header_bytes).
+
+    (* Manufacture boolean guard equalities explicitly. *)
+    assert (EL8  : (8 + lenN data <? 8) = false) by (apply N.ltb_ge; lia).
+    assert (ENbL : (lenN (udp_header_bytes h1 ++ data) <? 8 + lenN data) = false).
+    { rewrite HNbytes. apply N.ltb_ge. lia. }
+    assert (EEq  : (lenN (udp_header_bytes h1 ++ data) =? 8 + lenN data) = true).
+    { rewrite HNbytes. apply N.eqb_eq. reflexivity. }
+
+    (* Discharge the guards and StrictEq equality. *)
+    rewrite HL0id.            (* turns L into 8 + |data| *)
+    rewrite EL8.
+    rewrite ENbL.
+    change (length_rx_mode defaults_ipv4_allow0) with StrictEq.
+    rewrite EEq.
+
+    (* Non‑zero checksum on TX for IPv4. *)
+    assert (Ecz : N.eqb (compute_udp_checksum_ipv4 ipS ipD h0 data) 0 = false)
+      by (apply N.eqb_neq; apply compute_udp_checksum_ipv4_nonzero).
+    rewrite Ecz.
+
+    (* Verifier succeeds; delivered slice = data. *)
+    assert (Hdel : take (N.to_nat (8 + lenN data - 8)) data = data).
+    { rewrite N_add_sub_cancel_l, N_to_nat_lenN. apply take_length_id. }
+    rewrite Hdel.
+    rewrite (verify_checksum_ipv4_encode_ok ipS ipD sp dp data h0 h1 Hmk eq_refl).
+
+    (* Wrap into UdpDeliver and reconcile fields. *)
+    apply f_equal.
+    destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]].
+    now rewrite Hsp, Hdp.
   Qed.
 
 End UDP_R4_Source_Screening.
