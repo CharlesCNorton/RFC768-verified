@@ -3559,3 +3559,192 @@ Section UDP_Maximum_Length.
   Qed.
 
 End UDP_Maximum_Length.
+
+(** ****************************************************************************
+    Checksum Zero Edge Cases 
+    ----------------------------------------------------------------------------
+    Proves correct handling when computed checksum is 0x0000 (transmitted as
+    0xFFFF) and zero checksum acceptance policies.
+    **************************************************************************** *)
+
+Section UDP_Checksum_Zero.
+  Open Scope N_scope.
+
+  (** When computed checksum is 0x0000, transmitted value is 0xFFFF (mask16) *)
+  Theorem computed_zero_transmitted_mask16 :
+    forall ipS ipD sp dp data h0,
+      mk_header sp dp (lenN data) = Some h0 ->
+      cksum16 (checksum_words_ipv4 ipS ipD h0 data) = 0 ->
+      compute_udp_checksum_ipv4 ipS ipD h0 data = mask16.
+  Proof.
+    intros ipS ipD sp dp data h0 Hmk Hzero.
+    Transparent compute_udp_checksum_ipv4.
+    unfold compute_udp_checksum_ipv4.
+    apply N.eqb_eq in Hzero.
+    rewrite Hzero.
+    reflexivity.
+    Opaque compute_udp_checksum_ipv4.
+  Qed.
+
+  (** Example: packet with zero checksum is accepted *)
+  Example ex_zero_checksum_accepted :
+    let h := {| src_port := 1234;
+                dst_port := 5678;
+                length16 := 11;
+                checksum := 0 |} in
+    let data := [1; 2; 3]%N in
+    let wire := udp_header_bytes h ++ data in
+    decode_udp_ipv4 defaults_ipv4 ex_src ex_dst wire = Ok (1234, 5678, data).
+  Proof.
+    simpl.
+    unfold decode_udp_ipv4.
+    simpl.
+    reflexivity.
+  Qed.
+
+End UDP_Checksum_Zero.
+
+(** ****************************************************************************
+    Property Exhaustiveness
+    ----------------------------------------------------------------------------
+    Proves that the decoder result is exhaustive - it always returns one of
+    the four possible outcomes.
+    **************************************************************************** *)
+
+Section UDP_Exhaustiveness.
+  Open Scope N_scope.
+
+  (** The decoder always returns one of four possible outcomes *)
+  Theorem decode_total : 
+    forall cfg src dst wire,
+      (exists sp dp data, decode_udp_ipv4 cfg src dst wire = Ok (sp, dp, data)) \/
+      (decode_udp_ipv4 cfg src dst wire = Err BadLength) \/
+      (decode_udp_ipv4 cfg src dst wire = Err BadChecksum) \/
+      (decode_udp_ipv4 cfg src dst wire = Err DstPortZeroNotAllowed).
+  Proof.
+    intros cfg src dst wire.
+    unfold decode_udp_ipv4.
+    destruct (parse_header wire) as [[h rest]|] eqn:Hparse.
+    - (* Parse succeeded *)
+      destruct (dst_port0_policy cfg) eqn:Epol.
+      + (* Allow *)
+        destruct (length16 h <? 8) eqn:EL8.
+        * (* Length < 8 *)
+          right. left. reflexivity.
+        * (* Length >= 8 *)
+          destruct (lenN wire <? length16 h) eqn:ENbL.
+          -- (* Wire too short *)
+             right. left. reflexivity.
+          -- (* Wire long enough *)
+             destruct (length_rx_mode cfg) eqn:Emode.
+             ++ (* StrictEq *)
+                destruct (lenN wire =? length16 h) eqn:EEq.
+                ** (* Lengths match *)
+                   destruct (checksum h =? 0) eqn:Eck.
+                   --- (* Zero checksum *)
+                       destruct (checksum_rx_mode cfg) eqn:Erx.
+                       +++ (* RequireValidOnly *)
+                           right. right. left. reflexivity.
+                       +++ (* ValidOrZero *)
+                           destruct (zero_checksum_allowed cfg dst) eqn:Ezero.
+                           ++++ (* Zero allowed *)
+                                left. eexists. eexists. eexists. reflexivity.
+                           ++++ (* Zero not allowed *)
+                                right. right. left. reflexivity.
+                   --- (* Non-zero checksum *)
+                       destruct (verify_checksum_ipv4 src dst h 
+                                  (take (N.to_nat (length16 h - 8)) rest)) eqn:Ever.
+                       +++ (* Checksum valid *)
+                           left. eexists. eexists. eexists. reflexivity.
+                       +++ (* Checksum invalid *)
+                           right. right. left. reflexivity.
+                ** (* Lengths don't match *)
+                   right. left. reflexivity.
+             ++ (* AcceptShorterIP *)
+                destruct (checksum h =? 0) eqn:Eck.
+                ** (* Zero checksum *)
+                   destruct (checksum_rx_mode cfg) eqn:Erx.
+                   --- (* RequireValidOnly *)
+                       right. right. left. reflexivity.
+                   --- (* ValidOrZero *)
+                       destruct (zero_checksum_allowed cfg dst) eqn:Ezero.
+                       +++ (* Zero allowed *)
+                           left. eexists. eexists. eexists. reflexivity.
+                       +++ (* Zero not allowed *)
+                           right. right. left. reflexivity.
+                ** (* Non-zero checksum *)
+                   destruct (verify_checksum_ipv4 src dst h 
+                              (take (N.to_nat (length16 h - 8)) rest)) eqn:Ever.
+                   --- (* Checksum valid *)
+                       left. eexists. eexists. eexists. reflexivity.
+                   --- (* Checksum invalid *)
+                       right. right. left. reflexivity.
+      + (* Reject *)
+        destruct (dst_port h =? 0) eqn:Edp0.
+        * (* Port 0 rejected *)
+          right. right. right. reflexivity.
+        * (* Port non-zero *)
+          destruct (length16 h <? 8) eqn:EL8.
+          -- (* Length < 8 *)
+             right. left. reflexivity.
+          -- (* Length >= 8 *)
+             destruct (lenN wire <? length16 h) eqn:ENbL.
+             ++ (* Wire too short *)
+                right. left. reflexivity.
+             ++ (* Wire long enough *)
+                destruct (length_rx_mode cfg) eqn:Emode.
+                ** (* StrictEq *)
+                   destruct (lenN wire =? length16 h) eqn:EEq.
+                   --- (* Lengths match *)
+                       destruct (checksum h =? 0) eqn:Eck.
+                       +++ (* Zero checksum *)
+                           destruct (checksum_rx_mode cfg) eqn:Erx.
+                           ++++ (* RequireValidOnly *)
+                                right. right. left. reflexivity.
+                           ++++ (* ValidOrZero *)
+                                destruct (zero_checksum_allowed cfg dst) eqn:Ezero.
+                                +++++ (* Zero allowed *)
+                                      left. eexists. eexists. eexists. reflexivity.
+                                +++++ (* Zero not allowed *)
+                                      right. right. left. reflexivity.
+                       +++ (* Non-zero checksum *)
+                           destruct (verify_checksum_ipv4 src dst h 
+                                      (take (N.to_nat (length16 h - 8)) rest)) eqn:Ever.
+                           ++++ (* Checksum valid *)
+                                left. eexists. eexists. eexists. reflexivity.
+                           ++++ (* Checksum invalid *)
+                                right. right. left. reflexivity.
+                   --- (* Lengths don't match *)
+                       right. left. reflexivity.
+                ** (* AcceptShorterIP *)
+                   destruct (checksum h =? 0) eqn:Eck.
+                   --- (* Zero checksum *)
+                       destruct (checksum_rx_mode cfg) eqn:Erx.
+                       +++ (* RequireValidOnly *)
+                           right. right. left. reflexivity.
+                       +++ (* ValidOrZero *)
+                           destruct (zero_checksum_allowed cfg dst) eqn:Ezero.
+                           ++++ (* Zero allowed *)
+                                left. eexists. eexists. eexists. reflexivity.
+                           ++++ (* Zero not allowed *)
+                                right. right. left. reflexivity.
+                   --- (* Non-zero checksum *)
+                       destruct (verify_checksum_ipv4 src dst h 
+                                  (take (N.to_nat (length16 h - 8)) rest)) eqn:Ever.
+                       +++ (* Checksum valid *)
+                           left. eexists. eexists. eexists. reflexivity.
+                       +++ (* Checksum invalid *)
+                           right. right. left. reflexivity.
+    - (* Parse failed *)
+      right. left. reflexivity.
+  Qed.
+
+  (** Corollary: decoder never gets stuck *)
+  Corollary decode_never_stuck :
+    forall cfg src dst wire,
+      exists r, decode_udp_ipv4 cfg src dst wire = r.
+  Proof.
+    intros. eexists. reflexivity.
+  Qed.
+
+End UDP_Exhaustiveness.
