@@ -4681,59 +4681,6 @@ End UDP_IPv6.
    verification of the User Datagram Protocol (UDP) as specified in RFC 768,
    with extensions from RFC 1122/1812 for ICMP error handling.
    
-   ## Core Achievements
-   
-   ### 1. Complete RFC 768 Implementation
-   - Full UDP header parsing and serialization with big-endian encoding
-   - Internet checksum algorithm with one's complement arithmetic
-   - Pseudo-header construction for IPv4 (RFC 768 Section 2)
-   - All field validations (ports, length ≥ 8, checksum)
-   
-   ### 2. Verified Properties
-   - **Round-trip Correctness**: ∀ valid data, decode(encode(data)) = data
-   - **Checksum Correctness**: Proper computation and verification
-   - **Parser/Serializer Bijection**: Unique parsing of serialized headers
-   - **Decoder Exhaustiveness**: Always returns one of 4 outcomes
-   - **Memory Safety**: No buffer overflows, all bounds checked
-   
-   ### 3. Configuration Flexibility
-   - Multiple receiver modes (StrictEq, AcceptShorterIP)
-   - Checksum policies (mandatory, optional, zero-checksum handling)
-   - Destination port zero policies (Allow/Reject)
-   - Broadcast/multicast detection hooks
-   
-   ### 4. Edge Case Coverage
-   - Source port 0 ("no reply expected") - fully verified
-   - Maximum datagram size (65527 bytes payload) - proven correct
-   - Minimum datagram (header only, 8 bytes) - verified
-   - Zero checksum transmission (0x0000 → 0xFFFF) - proven
-   - Surplus byte handling in AcceptShorter mode - verified
-   
-   ### 5. ICMP Integration (RFC 1122/1812)
-   - Port unreachable generation with proper suppressions
-   - Multicast/broadcast ICMP suppression
-   - Source address screening with metadata
-   - Rate limiting hooks
-   
-   ### 6. IPv6 Support (RFC 8200)
-   - 128-bit addressing structure
-   - IPv6 pseudo-header implementation
-   - Mandatory checksum enforcement
-   - Full round-trip and completeness theorems proven
-   
-   ## Verification Statistics
-   - ~2500 lines of specifications and proofs
-   - 70+ proven theorems and lemmas
-   - 100% coverage of RFC 768 requirements for both IPv4 and IPv6
-   - Zero admitted lemmas in the implementation
-   
-   ## What Makes This Significant
-   
-   This appears to be the **first complete formally verified UDP implementation**
-   in any proof assistant. Previous work (Cambridge Netsem) provided 
-   specifications but not verified executable code. This fills a critical gap 
-   in verified systems infrastructure.
-   
    ## Future Work
    
    ### 1. Extraction and Testing
@@ -4764,7 +4711,5 @@ End UDP_IPv6.
    - decode_udp_ipv6: Parses and validates incoming IPv6 datagrams
    - Configurable policies via the Config record
    
-   This verification ensures that any system using this UDP implementation
-   has mathematically proven correctness for all UDP packet handling.
-   
    **************************************************************************** *)
+ 
