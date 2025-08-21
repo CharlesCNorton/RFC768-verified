@@ -3303,3 +3303,259 @@ Qed.
 
 End UDP_Required_Examples.
 
+(** ****************************************************************************
+    Port Zero Source Handling
+    ----------------------------------------------------------------------------
+    RFC 768 permits source port 0 meaning "no reply expected". We prove this
+    works correctly through encode/decode cycles.
+    **************************************************************************** *)
+
+Section UDP_Port_Zero_Source.
+  Open Scope N_scope.
+
+  (** Encoding with source port 0 succeeds *)
+  Theorem encode_source_port_zero_ok :
+    forall cfg ipS ipD dp data,
+      8 + lenN data <= mask16 ->
+      exists wire, encode_udp_ipv4 cfg ipS ipD 0 dp data = Ok wire.
+  Proof.
+    intros cfg ipS ipD dp data Hlen.
+    unfold encode_udp_ipv4.
+    assert (Hmk: mk_header 0 dp (lenN data) = 
+            Some {| src_port := 0;
+                    dst_port := to_word16 dp;
+                    length16 := to_word16 (8 + lenN data);
+                    checksum := 0 |}).
+    { unfold mk_header.
+      apply N.leb_le in Hlen. rewrite Hlen.
+      reflexivity. }
+    rewrite Hmk.
+    destruct (checksum_tx_mode cfg); eexists; reflexivity.
+  Qed.
+
+  (** Decoding with source port 0 succeeds (with non-zero dst port) *)
+  Theorem decode_source_port_zero_ok :
+    forall ipS ipD dp data wire h0,
+      to_word16 dp <> 0 ->
+      mk_header 0 dp (lenN data) = Some h0 ->
+      encode_udp_ipv4 defaults_ipv4 ipS ipD 0 dp data = Ok wire ->
+      decode_udp_ipv4 defaults_ipv4 ipS ipD wire = Ok (0, to_word16 dp, data).
+  Proof.
+    intros ipS ipD dp data wire h0 Hdp_nz Hmk Henc.
+    apply (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 
+           ipS ipD 0 dp data wire h0 Hdp_nz Hmk Henc).
+  Qed.
+
+  (** Round-trip with source port 0 preserves data *)
+  Theorem roundtrip_source_port_zero :
+    forall ipS ipD dp data,
+      to_word16 dp <> 0 ->
+      8 + lenN data <= mask16 ->
+      exists wire,
+        encode_udp_ipv4 defaults_ipv4 ipS ipD 0 dp data = Ok wire /\
+        decode_udp_ipv4 defaults_ipv4 ipS ipD wire = Ok (0, to_word16 dp, data).
+  Proof.
+    intros ipS ipD dp data Hdp_nz Hlen.
+    assert (Hmk: exists h0, mk_header 0 dp (lenN data) = Some h0).
+    { unfold mk_header.
+      apply N.leb_le in Hlen. rewrite Hlen.
+      eexists; reflexivity. }
+    destruct Hmk as [h0 Hmk].
+    pose proof (encode_source_port_zero_ok defaults_ipv4 ipS ipD dp data Hlen) as [wire Henc].
+    exists wire. split.
+    - exact Henc.
+    - apply (decode_source_port_zero_ok ipS ipD dp data wire h0 Hdp_nz Hmk Henc).
+  Qed.
+
+(** Example: concrete test with source port 0 *)
+  Example ex_source_port_zero :
+    let payload := [1; 2; 3]%N in
+    exists wire,
+      encode_udp_ipv4 defaults_ipv4 ex_src ex_dst 0 4242 payload = Ok wire /\
+      decode_udp_ipv4 defaults_ipv4 ex_src ex_dst wire = Ok (0, 4242, payload).
+  Proof.
+    simpl. 
+    apply roundtrip_source_port_zero.
+    - intro H. vm_compute in H. discriminate.
+    - discriminate.
+  Qed.
+  
+End UDP_Port_Zero_Source.
+
+(** ****************************************************************************
+    Maximum Length Edge Cases
+    ----------------------------------------------------------------------------
+    RFC 768 maximum datagram size handling: proves that the maximum valid
+    datagram (65527 bytes of data, total 65535) works correctly and that
+    length field overflow is impossible.
+    **************************************************************************** *)
+
+Section UDP_Maximum_Length.
+  Open Scope N_scope.
+
+  (** Maximum data size that fits in UDP (65535 total - 8 header) *)
+  Definition max_udp_data_size : N := mask16 - 8.
+  
+  (** Maximum total UDP datagram size *)
+  Definition max_udp_total_size : N := mask16.
+
+(** Proof that maximum valid datagram encodes successfully *)
+  Theorem encode_maximum_datagram_ok :
+    forall cfg ipS ipD sp dp,
+      exists wire,
+        encode_udp_ipv4 cfg ipS ipD sp dp (bytes_n max_udp_data_size) = Ok wire /\
+        lenN wire = max_udp_total_size.
+  Proof.
+    intros cfg ipS ipD sp dp.
+    assert (Hlen: 8 + lenN (bytes_n max_udp_data_size) <= mask16).
+    { rewrite lenN_bytes_n. unfold max_udp_data_size.
+      assert (8 + (mask16 - 8) = mask16).
+      { unfold mask16. simpl. reflexivity. }
+      rewrite H. reflexivity. }
+    
+    unfold encode_udp_ipv4.
+    assert (Hmk: exists h0, mk_header sp dp (lenN (bytes_n max_udp_data_size)) = Some h0).
+    { unfold mk_header. rewrite lenN_bytes_n.
+      unfold max_udp_data_size.
+      assert ((8 + (mask16 - 8) <=? mask16) = true).
+      { apply N.leb_le. 
+        assert (8 + (mask16 - 8) = mask16).
+        { unfold mask16. simpl. reflexivity. }
+        rewrite H. reflexivity. }
+      rewrite H. eexists; reflexivity. }
+    destruct Hmk as [h0 Hmk].
+    rewrite Hmk.
+    
+    destruct (checksum_tx_mode cfg) eqn:Etx.
+    - (* WithChecksum *)
+      exists (udp_header_bytes
+               {| src_port := src_port h0;
+                  dst_port := dst_port h0;
+                  length16 := length16 h0;
+                  checksum := compute_udp_checksum_ipv4 ipS ipD h0 (bytes_n max_udp_data_size) |}
+             ++ bytes_n max_udp_data_size).
+      split.
+      + reflexivity.
+      + rewrite lenN_app, lenN_udp_header_bytes_8, lenN_bytes_n.
+        unfold max_udp_data_size, max_udp_total_size.
+        assert (8 + (mask16 - 8) = mask16).
+        { unfold mask16. simpl. reflexivity. }
+        exact H.
+    - (* NoChecksum *)
+      exists (udp_header_bytes
+               {| src_port := src_port h0;
+                  dst_port := dst_port h0;
+                  length16 := length16 h0;
+                  checksum := 0 |}
+             ++ bytes_n max_udp_data_size).
+      split.
+      + reflexivity.
+      + rewrite lenN_app, lenN_udp_header_bytes_8, lenN_bytes_n.
+        unfold max_udp_data_size, max_udp_total_size.
+        assert (8 + (mask16 - 8) = mask16).
+        { unfold mask16. simpl. reflexivity. }
+        exact H.
+  Qed.
+
+  (** Proof that length field overflow is impossible *)
+  Theorem length_field_no_overflow :
+    forall sp dp data_len h,
+      mk_header sp dp data_len = Some h ->
+      length16 h < two16.
+  Proof.
+    intros sp dp data_len h Hmk.
+    destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL _]]]].
+    rewrite HL.
+    apply to_word16_lt_two16.
+  Qed.
+
+  (** The length field correctly represents 8 + data_len when valid *)
+  Theorem length_field_correct :
+    forall sp dp data_len h,
+      mk_header sp dp data_len = Some h ->
+      length16 h = to_word16 (8 + data_len) /\
+      8 + data_len <= mask16.
+  Proof.
+    intros sp dp data_len h Hmk.
+    destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL _]]]].
+    split.
+    - exact HL.
+    - exact Hle.
+  Qed.
+
+  (** Attempting to encode data larger than max fails with Oversize *)
+  Theorem encode_oversized_fails :
+    forall cfg ipS ipD sp dp,
+      encode_udp_ipv4 cfg ipS ipD sp dp (bytes_n (max_udp_data_size + 1)) = Err Oversize.
+  Proof.
+    intros cfg ipS ipD sp dp.
+    rewrite encode_oversize_iff.
+    rewrite lenN_bytes_n.
+    unfold max_udp_data_size. lia.
+  Qed.
+
+  (** The maximum valid length field value is exactly mask16 *)
+  Theorem max_length_field_value :
+    forall sp dp h,
+      mk_header sp dp max_udp_data_size = Some h ->
+      length16 h = mask16.
+  Proof.
+    intros sp dp h Hmk.
+    destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [_ [_ [HL _]]]].
+    rewrite HL.
+    unfold max_udp_data_size.
+    assert (8 + (mask16 - 8) = mask16) by lia.
+    rewrite H.
+    apply to_word16_id_if_le_mask.
+    lia.
+  Qed.
+
+(** Round-trip at maximum size preserves data *)
+  Theorem roundtrip_maximum_size :
+    forall ipS ipD sp dp,
+      to_word16 dp <> 0 ->
+      exists wire h0,
+        mk_header sp dp max_udp_data_size = Some h0 /\
+        encode_udp_ipv4 defaults_ipv4 ipS ipD sp dp (bytes_n max_udp_data_size) = Ok wire /\
+        decode_udp_ipv4 defaults_ipv4 ipS ipD wire = 
+          Ok (to_word16 sp, to_word16 dp, bytes_n max_udp_data_size).
+  Proof.
+    intros ipS ipD sp dp Hdp_nz.
+    assert (Hmk: exists h0, mk_header sp dp (lenN (bytes_n max_udp_data_size)) = Some h0).
+    { unfold mk_header. rewrite lenN_bytes_n.
+      unfold max_udp_data_size.
+      assert ((8 + (mask16 - 8) <=? mask16) = true).
+      { apply N.leb_le. 
+        assert (8 + (mask16 - 8) = mask16).
+        { unfold mask16. simpl. reflexivity. }
+        rewrite H. reflexivity. }
+      rewrite H. eexists; reflexivity. }
+    destruct Hmk as [h0 Hmk].
+    
+    pose proof (encode_maximum_datagram_ok defaults_ipv4 ipS ipD sp dp) as [wire [Henc _]].
+    exists wire, h0.
+    split; [|split].
+    - rewrite lenN_bytes_n in Hmk. exact Hmk.
+    - exact Henc.
+    - rewrite lenN_bytes_n in Hmk.
+      apply (decode_encode_roundtrip_ipv4_defaults_reject_nonzero16
+               ipS ipD sp dp (bytes_n max_udp_data_size) wire h0 Hdp_nz Hmk Henc).
+  Qed.
+
+(** No valid data size can cause length overflow *)
+  Theorem no_valid_length_overflow :
+    forall (data : list byte),
+      lenN data <= max_udp_data_size ->
+      8 + lenN data <= mask16.
+  Proof.
+    intros data Hdata.
+    unfold max_udp_data_size in Hdata.
+    assert (lenN data <= mask16 - 8) by exact Hdata.
+    assert (8 + lenN data <= 8 + (mask16 - 8)).
+    { apply N.add_le_mono_l. exact H. }
+    assert (8 + (mask16 - 8) = mask16).
+    { unfold mask16. simpl. reflexivity. }
+    rewrite H1 in H0. exact H0.
+  Qed.
+
+End UDP_Maximum_Length.
