@@ -4097,6 +4097,225 @@ Section UDP_IPv6.
     exact H.
   Qed.
   
+(** Helper: Header norm for IPv6 encoded headers *)
+Lemma header_norm_encode_ipv6 :
+  forall sp dp len h0 src dst data,
+    mk_header sp dp len = Some h0 ->
+    header_norm {| src_port := src_port h0;
+                   dst_port := dst_port h0;
+                   length16 := length16 h0;
+                   checksum := compute_udp_checksum_ipv6 src dst h0 data |}.
+Proof.
+  intros sp dp len h0 src dst data Hmk.
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp [Hlen _]]]].
+  unfold header_norm; simpl.
+  rewrite Hsp, Hdp, Hlen.
+  repeat split; try apply to_word16_lt_two16.
+  (* The checksum field *)
+  unfold compute_udp_checksum_ipv6.
+  destruct (cksum16 (checksum_words_ipv6 src dst h0 data) =? 0).
+  - (* Zero case: returns mask16 *)
+    unfold mask16, two16. compute. constructor.
+  - (* Non-zero case: returns cksum16 value *)
+    apply cksum16_lt_two16.
+Qed.
+
+(** IPv6 never generates zero checksum (unlike IPv4) *)
+Theorem ipv6_checksum_never_zero :
+  forall src dst sp dp data wire,
+    encode_udp_ipv6 src dst sp dp data = Ok wire ->
+    exists h rest,
+      parse_header wire = Some (h, rest) /\
+      checksum h <> 0.
+Proof.
+  intros src dst sp dp data wire Henc.
+  unfold encode_udp_ipv6 in Henc.
+  destruct (mk_header sp dp (lenN data)) as [h0|] eqn:Hmk; [|discriminate].
+  inversion Henc; subst wire; clear Henc.
+  
+  (* The wire is udp_header_bytes of h1 ++ data *)
+  set (c := compute_udp_checksum_ipv6 src dst h0 data).
+  set (h1 := {| src_port := src_port h0;
+                dst_port := dst_port h0;
+                length16 := length16 h0;
+                checksum := c |}).
+  
+  exists h1, data.
+  split.
+  - (* Parse succeeds *)
+    assert (Hnorm: header_norm h1).
+{ unfold h1. apply header_norm_encode_ipv6 with (sp := sp) (dp := dp) (len := lenN data). exact Hmk. }
+    apply parse_header_bytes_of_header_norm. exact Hnorm.
+  - (* Checksum is non-zero *)
+    unfold h1, c; simpl.
+    apply compute_udp_checksum_ipv6_nonzero.
+Qed.
+
+(** Verifier accepts packets with computed IPv6 checksum *)
+Lemma verify_checksum_ipv6_encode_ok :
+  forall src dst sp dp data h0 h1,
+    mk_header sp dp (lenN data) = Some h0 ->
+    h1 = {| src_port := src_port h0;
+            dst_port := dst_port h0;
+            length16 := length16 h0;
+            checksum := compute_udp_checksum_ipv6 src dst h0 data |} ->
+    verify_checksum_ipv6 src dst h1 data = true.
+Proof.
+  intros src dst sp dp data h0 h1 Hmk ->.
+  unfold verify_checksum_ipv6.
+  
+  (* The checksum material is the same whether we use h0 or h1 *)
+  assert (Heq: checksum_words_ipv6 src dst 
+           {| src_port := src_port h0;
+              dst_port := dst_port h0;
+              length16 := length16 h0;
+              checksum := compute_udp_checksum_ipv6 src dst h0 data |} data =
+           checksum_words_ipv6 src dst h0 data).
+  { unfold checksum_words_ipv6, udp_header_words_zero_ck. simpl. reflexivity. }
+  
+  rewrite Heq.
+  simpl.
+  
+  (* Apply the key property: sum16 with computed checksum = mask16 *)
+  apply N.eqb_eq.
+  apply sum16_with_computed_ipv6.
+Qed.
+
+(** Decoder structure lemma for IPv6 - everything up to checksum verification *)
+Lemma decode_ipv6_structure :
+  forall src dst sp dp data h0,
+    to_word16 dp <> 0 ->
+    mk_header sp dp (lenN data) = Some h0 ->
+    let h1 := {| src_port := src_port h0;
+                 dst_port := dst_port h0;
+                 length16 := length16 h0;
+                 checksum := compute_udp_checksum_ipv6 src dst h0 data |} in
+    let wire := udp_header_bytes h1 ++ data in
+    decode_udp_ipv6 src dst wire = 
+      if verify_checksum_ipv6 src dst h1 (take (N.to_nat (length16 h1 - 8)) data)
+      then Ok (src_port h1, dst_port h1, take (N.to_nat (length16 h1 - 8)) data)
+      else Err BadChecksum.
+Proof.
+  intros src dst sp dp data h0 Hdp_nz Hmk.
+  
+  (* Define the header with checksum *)
+  set (h1 := {| src_port := src_port h0;
+                dst_port := dst_port h0;
+                length16 := length16 h0;
+                checksum := compute_udp_checksum_ipv6 src dst h0 data |}).
+  
+  (* Start decoding *)
+  unfold decode_udp_ipv6.
+  
+  (* Parse succeeds *)
+  assert (Hnorm: header_norm h1) by (unfold h1; eapply header_norm_encode_ipv6; exact Hmk).
+  rewrite (parse_header_bytes_of_header_norm h1 data Hnorm).
+  
+  (* Check destination port *)
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [_ [Hdp _]]].
+  assert (Hdp_eq: dst_port h1 = to_word16 dp) by (unfold h1; simpl; exact Hdp).
+  rewrite Hdp_eq.
+  rewrite <- N.eqb_neq in Hdp_nz.
+  rewrite Hdp_nz.
+  
+  (* Length checks *)
+  destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [Hsp [_ [HL _]]]].
+  assert (HL_eq: length16 h1 = to_word16 (8 + lenN data)) by (unfold h1; simpl; exact HL).
+  rewrite HL_eq.
+  rewrite to_word16_id_if_le_mask by exact Hle.
+  
+  assert (EL8: (8 + lenN data <? 8) = false) by (apply N.ltb_ge; lia).
+  rewrite EL8.
+  
+  assert (HNbytes: lenN (udp_header_bytes h1 ++ data) = 8 + lenN data)
+    by (rewrite lenN_app, lenN_udp_header_bytes_8; reflexivity).
+  rewrite HNbytes.
+  
+  assert (ENbL: (8 + lenN data <? 8 + lenN data) = false) by (apply N.ltb_ge; lia).
+  rewrite ENbL.
+  
+  assert (EEq: (8 + lenN data =? 8 + lenN data) = true) by (apply N.eqb_eq; reflexivity).
+  rewrite EEq. simpl.
+  
+  (* Checksum is never zero in IPv6 *)
+  assert (Hck_eq: checksum h1 = compute_udp_checksum_ipv6 src dst h0 data) 
+    by (unfold h1; simpl; reflexivity).
+  rewrite <- Hck_eq.
+  assert (Hck_nz: checksum h1 <> 0) 
+    by (rewrite Hck_eq; apply compute_udp_checksum_ipv6_nonzero).
+  rewrite <- N.eqb_neq in Hck_nz.
+  rewrite Hck_nz.
+  
+  reflexivity.
+Qed.
+
+(** Helper: Decoder returns expected values for IPv6 *)
+Lemma decode_ipv6_returns_values :
+  forall src dst sp dp data h0,
+    to_word16 dp <> 0 ->
+    mk_header sp dp (lenN data) = Some h0 ->
+    let h1 := {| src_port := src_port h0;
+                 dst_port := dst_port h0;
+                 length16 := length16 h0;
+                 checksum := compute_udp_checksum_ipv6 src dst h0 data |} in
+    let wire := udp_header_bytes h1 ++ data in
+    decode_udp_ipv6 src dst wire = Ok (src_port h0, dst_port h0, data).
+Proof.
+  intros src dst sp dp data h0 Hdp_nz Hmk.
+  
+  (* Define the header with checksum *)
+  set (h1 := {| src_port := src_port h0;
+                dst_port := dst_port h0;
+                length16 := length16 h0;
+                checksum := compute_udp_checksum_ipv6 src dst h0 data |}).
+  
+  (* Apply the structure lemma *)
+  unfold h1.
+  rewrite (decode_ipv6_structure src dst sp dp data h0 Hdp_nz Hmk).
+  fold h1.
+  
+  (* Simplify the take operation *)
+  destruct (mk_header_ok _ _ _ _ Hmk) as [Hle [Hsp [Hdp' [HL _]]]].
+  assert (Htake: take (N.to_nat (length16 h1 - 8)) data = data).
+  { unfold h1; simpl.
+    rewrite HL.
+    rewrite to_word16_id_if_le_mask by exact Hle.
+    rewrite N_add_sub_cancel_l, N_to_nat_lenN.
+    apply take_length_id. }
+  rewrite Htake.
+  
+  (* Apply verifier correctness *)
+  rewrite (verify_checksum_ipv6_encode_ok src dst sp dp data h0 h1 Hmk eq_refl).
+  
+  reflexivity.
+Qed.
+
+(** Round-trip correctness for IPv6 *)
+Theorem decode_encode_roundtrip_ipv6 :
+  forall src dst sp dp data wire h0,
+    to_word16 dp <> 0 ->
+    mk_header sp dp (lenN data) = Some h0 ->
+    encode_udp_ipv6 src dst sp dp data = Ok wire ->
+    decode_udp_ipv6 src dst wire = Ok (to_word16 sp, to_word16 dp, data).
+Proof.
+  intros src dst sp dp data wire h0 Hdp_nz Hmk Henc.
+  
+  (* Analyze the encoder output *)
+  unfold encode_udp_ipv6 in Henc.
+  rewrite Hmk in Henc.
+  inversion Henc; subst wire; clear Henc.
+  
+  (* Apply the helper lemma *)
+  rewrite (decode_ipv6_returns_values src dst sp dp data h0 Hdp_nz Hmk).
+  
+  (* Show that src_port h0 = to_word16 sp and dst_port h0 = to_word16 dp *)
+  destruct (mk_header_ok _ _ _ _ Hmk) as [_ [Hsp [Hdp _]]].
+  rewrite Hsp, Hdp.
+  reflexivity.
+Qed.
+
+
+
 End UDP_IPv6.
 
 (** ****************************************************************************
