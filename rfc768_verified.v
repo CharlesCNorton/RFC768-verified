@@ -171,8 +171,9 @@ Fixpoint bytes_of_words16_be (ws:list word16) : list byte :=
 Fixpoint words16_of_bytes_be (bs:list byte) : list word16 :=
   match bs with
   | [] => []
-  | [b] => [ word16_of_be b 0 ]  (* odd length: pad one zero byte *)
-  | b1::b2::tl => word16_of_be b1 b2 :: words16_of_bytes_be tl
+  | [b] => [ word16_of_be (to_byte b) 0 ]
+  | b1::b2::tl =>
+      word16_of_be (to_byte b1) (to_byte b2) :: words16_of_bytes_be tl
   end.
 
 Lemma lenN_bytes_of_words16_be_4 :
