@@ -1198,7 +1198,21 @@ Record ConfigWithICMP := {
 Definition defaults_ipv4_with_icmp : ConfigWithICMP :=
   {| base_config := defaults_ipv4;
      rate_limit_icmp := fun _ _ => true |}.  (* no rate limiting by default *)
+     
+(* ---- Rate-limited ICMP advice -------------------------- *)
+(* Gate the existing advice with the ConfigWithICMP.rate_limit_icmp hook.     *)
+Definition udp_complete_icmp_advice_rl
+  (cfg:ConfigWithICMP)
+  (has_listener: IPv4 -> word16 -> bool)
+  (src_ip dst_ip:IPv4)
+  (flow_hash now:N)
+  (res: result UdpDeliver DecodeError)
+  : RxAdvice :=
+  if cfg.(rate_limit_icmp) flow_hash now
+  then udp_complete_icmp_advice cfg.(base_config) has_listener src_ip dst_ip res
+  else NoAdvice.
 
+     
 (* ----------------------------------------------------------------------------
    7) Parser/serializer round-trip and checksum correctness proofs
    --------------------------------------------------------------------------*)
