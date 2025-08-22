@@ -4863,30 +4863,56 @@ Qed.
 
 End UDP_ModCarry_Equivalence.
 
-(* Round‑trip for BE16 under < 2^16 *)
-Lemma words16_bytes16_roundtrip :
-  forall ws, Forall (fun w => w < two16) ws ->
-  words16_of_bytes_be (bytes_of_words16_be ws) = ws.
-Proof.
-  induction ws as [|w tl IH]; intros H; simpl; [reflexivity|].
-  inversion H as [|? ? Hw Htl]; clear H.
-  unfold be16_of_word16.
-  rewrite to_word16_id_if_lt by exact Hw.
-  (* Now your existing word16_of_be_be16 / normalize lemmas close it *)
-  rewrite word16_of_be_reconstruct by auto.
-  f_equal. apply IH. exact Htl.
-Qed.
+(** --------------------------------------------------------------------------- *)
+(**  Serialization round‑trip extras (robust to Opaque be16_of_word16)          *)
+(** --------------------------------------------------------------------------- *)
 
-(* Length of words16_of_bytes_be: ceil(|bs|/2) *)
+Section UDP_Serialization_Extras.
+  Import ListNotations.
+
+  (* Canonicalization for bytes: if < 256, mod 256 is identity *)
+  Lemma to_byte_id_if_lt : forall x, x < two8 -> to_byte x = x.
+  Proof. intros x Hx; unfold to_byte; now apply N.mod_small. Qed.
+
 Lemma lenN_words16_of_bytes_be :
   forall bs, lenN (words16_of_bytes_be bs) = (lenN bs + 1) / 2.
 Proof.
-  induction bs as [|b0 [|b1 tl] IH]; simpl; try reflexivity.
-  - cbv; lia.
-  - rewrite IH. cbv; lia.
+  fix IH 1.
+  intro bs.
+  destruct bs as [|b1 bs'].
+  - (* Empty *)
+    cbn. cbv [lenN]. reflexivity.
+  - destruct bs' as [|b2 tl].
+    + (* Single [b1] *)
+      cbn. cbv [lenN]. simpl. reflexivity. 
+    + (* b1::b2::tl *)
+      cbn [words16_of_bytes_be].
+      rewrite lenN_cons.
+      rewrite IH.
+      rewrite !lenN_cons.
+      (* Goal: 1 + (lenN tl + 1) / 2 = (1 + (1 + lenN tl) + 1) / 2 *)
+      replace (1 + (1 + lenN tl) + 1) with (lenN tl + 3) by lia.
+      replace (lenN tl + 3) with ((lenN tl + 1) + 1 * 2) by lia.
+      rewrite N.div_add by (cbv; discriminate).
+      lia.
 Qed.
 
+  (* Optional: the general “bytes length is 2× words length” helper *)
+Lemma lenN_bytes_of_words16_be :
+  forall ws, lenN (bytes_of_words16_be ws) = 2 * lenN ws.
+Proof.
+  induction ws as [|w tl IH].
+  - simpl. reflexivity.
+  - change (lenN (bytes_of_words16_be (w :: tl)) = 2 * lenN (w :: tl)).
+    simpl bytes_of_words16_be.
+    destruct (be16_of_word16 (to_word16 w)) as [hi lo].
+    change (lenN (hi :: lo :: bytes_of_words16_be tl) = 2 * lenN (w :: tl)).
+    rewrite !lenN_cons.
+    rewrite IH.
+    lia.
+Qed.
 
+End UDP_Serialization_Extras.
 
 (** ****************************************************************************
    
