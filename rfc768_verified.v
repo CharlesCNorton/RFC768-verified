@@ -5003,7 +5003,55 @@ split.
 
 End UDP_Grand_Unified_Example.
 
+Section UDP_Fiendish_Application.
+  Open Scope N_scope.
 
+  Theorem UDP_Fiendish_Scenario :
+    exists wire0 wire_max wire_broken,
+      (* 1. Port 0 packet exists and decodes correctly *)
+      encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 0 53 small_data = Ok wire0 /\
+      decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire0 = Ok (0, 53, small_data) /\
+      
+      (* 2. Maximum size packet exists *)
+      encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 12345 53 (bytes_n max_udp_data_size) = Ok wire_max /\
+      
+      (* 3. A "broken" packet with zero checksum still decodes *)
+      wire_broken = udp_header_bytes {| src_port := 0; dst_port := 53; length16 := 11; checksum := 0 |} ++ small_data /\
+      decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire_broken = Ok (0, 53, small_data) /\
+      
+      (* 4. The checksums of permuted data are equal *)
+      cksum16 (words16_of_bytes_be small_data) = cksum16 (words16_of_bytes_be [3; 2; 1]) /\
+      
+      (* 5. Oversize by even 1 byte fails *)
+      encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 0 53 (bytes_n (mask16 - 7)) = Err Oversize /\
+      
+      (* 6. Both multicast detection results hold simultaneously *)
+      is_multicast_ipv4 (mkIPv4 224 0 0 1) = true /\
+      is_multicast_ipv6 (mkIPv6 0xFF02 0 0 0 0 0 0 1) = true.
+
+  Proof.
+    pose proof UDP_Complete_Proven_Example as H.
+    destruct H as [H1 [H2 [H3 [H4 [H5a [H5b [H6 [H7 H8]]]]]]]].
+    
+    destruct H1 as [wire0 [Henc0 Hdec0]].
+    destruct H7 as [wire_max Henc_max].
+    
+    set (wire_broken := udp_header_bytes {| src_port := 0; dst_port := 53; length16 := 11; checksum := 0 |} ++ small_data).
+    
+    exists wire0, wire_max, wire_broken.
+    
+    split. exact Henc0.
+    split. exact Hdec0.
+    split. exact Henc_max.
+    split. reflexivity.
+    split. reflexivity.
+    split. unfold small_data. simpl. reflexivity.
+    split. exact H2.
+    split. exact H5a.
+    exact H6.
+  Qed.
+
+End UDP_Fiendish_Application.
 
 (** ****************************************************************************
    
@@ -5048,3 +5096,4 @@ End UDP_Grand_Unified_Example.
    has mathematically proven correctness for all UDP packet handling.
    
    **************************************************************************** *)
+ 
