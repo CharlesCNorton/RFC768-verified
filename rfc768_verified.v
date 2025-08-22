@@ -4805,6 +4805,66 @@ Qed.
 
 End UDP_Permutation_Invariance.
 
+(**
+===============================================================================
+Equivalence with “mod‑and‑carry” checksum (no unfolding of [add16_ones])
+===============================================================================
+*)
+
+Section UDP_ModCarry_Equivalence.
+  Open Scope N_scope.
+
+  (* Small arithmetic helper: (a - b) + b = a when b <= a. *)
+  Lemma add_sub_cancel_N : forall a b, b <= a -> (a - b) + b = a.
+  Proof. intros; lia. Qed.
+
+(** End-around addition equals (mod 2^16) + (carry), for inputs < 2^16. *)
+Lemma add16_ones_modcarry :
+  forall x y,
+    x < two16 -> y < two16 ->
+    add16_ones x y = ((x + y) mod two16) + ((x + y) / two16).
+Proof.
+  intros x y Hx Hy.
+  set (s := x + y).
+  destruct (N.lt_ge_cases s two16) as [Hlt|Hge].
+  - (* no overflow: s < 2^16 *)
+    rewrite (add16_ones_no_overflow x y Hlt).
+    rewrite N.mod_small by exact Hlt.
+    rewrite N.div_small by exact Hlt.
+    rewrite N.add_0_r.
+    unfold s; reflexivity.
+  - (* overflow: 2^16 <= s < 2*2^16 *)
+    assert (Hge' : x + y >= two16) by (unfold s in Hge; lia).
+    rewrite (add16_ones_overflow x y Hge').  (* LHS = s - mask16 *)
+    set (r := s - two16).
+    assert (Hr_lt : r < two16) by (unfold r; lia).
+    assert (two16_ne : two16 <> 0) by (cbv [two16]; lia).
+    assert (Hs_eq : s = two16 + r) by (unfold r; lia).
+    (* mod part: (s mod 2^16) = r *)
+    replace (s mod two16) with ((r + 1 * two16) mod two16)
+      by (rewrite Hs_eq, N.add_comm, N.mul_1_l; reflexivity).
+    rewrite (N.mod_add r 1 two16) by exact two16_ne.
+    rewrite N.mod_small by exact Hr_lt.
+    (* div part: (s / 2^16) = 1 *)
+    replace (s / two16) with ((r + 1 * two16) / two16)
+      by (rewrite Hs_eq, N.add_comm, N.mul_1_l; reflexivity).
+    replace ((r + 1 * two16) / two16) with ((1 * two16 + r) / two16)
+      by (f_equal; apply N.add_comm).
+    rewrite N.div_add_l by exact two16_ne.
+    rewrite N.div_small by exact Hr_lt.
+    rewrite N.add_0_r.                       (* 1 + 0 -> 1 *)
+    (* finalize: s = 2^16 + r, mask16 = 2^16 - 1 *)
+    unfold s.
+    assert (x + y = two16 + r) by (unfold s in Hs_eq; exact Hs_eq).
+    rewrite H.
+    cbv [mask16 two16]; lia.
+Qed.
+
+End UDP_ModCarry_Equivalence.
+
+
+
+
 (** ****************************************************************************
    
    RFC 768 UDP/IPv4 Formal Verification in Coq
