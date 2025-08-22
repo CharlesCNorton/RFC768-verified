@@ -4914,6 +4914,97 @@ Qed.
 
 End UDP_Serialization_Extras.
 
+Section UDP_Grand_Unified_Example.
+  Open Scope N_scope.
+
+  (* Test data and addresses *)
+  Definition test_src_v4 := mkIPv4 10 0 0 1.
+  Definition test_dst_v4 := mkIPv4 10 0 0 2.
+  Definition test_src_v6 := mkIPv6 0x2001 0x0db8 0 0 0 0 0 1.
+  Definition test_dst_v6 := mkIPv6 0x2001 0x0db8 0 0 0 0 0 2.
+  Definition small_data : list byte := [1; 2; 3].
+
+  (* Fully Proven Comprehensive Example *)
+  Theorem UDP_Complete_Proven_Example :
+    (* 1. Source port 0 handling *)
+    (exists wire,
+       encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 0 53 small_data = Ok wire /\
+       decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire = Ok (0, 53, small_data)) /\
+    
+    (* 2. Oversize rejection *)
+    encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 12345 53 (bytes_n n_over) = Err Oversize /\
+    
+    (* 3. Zero checksum accepted in IPv4 *)
+    decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 
+      (udp_header_bytes {| src_port := 12345; dst_port := 53; length16 := 11; checksum := 0 |} ++ small_data) = 
+      Ok (12345, 53, small_data) /\
+    
+    (* 4. Checksum permutation invariance *)
+    cksum16 [1; 2; 3] = cksum16 [3; 2; 1] /\
+    
+    (* 5. Multicast detection *)
+    is_multicast_ipv4 (mkIPv4 224 0 0 1) = true /\
+    is_multicast_ipv4 test_dst_v4 = false /\
+    
+    (* 6. IPv6 multicast detection *)
+    is_multicast_ipv6 (mkIPv6 0xFF02 0 0 0 0 0 0 1) = true /\
+    
+    (* 7. Maximum valid size encoding succeeds *)
+    (exists wire, encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 12345 53 (bytes_n max_udp_data_size) = Ok wire) /\
+    
+    (* 8. Decoder exhaustiveness *)
+    (forall wire, exists r, decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire = r).
+
+  Proof.
+    split.
+    (* 1. Source port 0 *)
+    { apply roundtrip_source_port_zero.
+      - intro H; vm_compute in H; discriminate.
+      - simpl. vm_compute. discriminate. }
+    
+    split.
+    (* 2. Oversize *)
+    { apply EX_encode_oversize_at_boundary. }
+    
+    split.
+    (* 3. Zero checksum accepted *)
+    { reflexivity. }
+    
+    split.
+(* 4. Checksum permutation *)
+    { apply cksum16_perm.
+      eapply perm_trans.
+      2: { apply perm_swap. } (* [2; 3; 1] ~ [3; 2; 1] *)
+      eapply perm_trans.
+      2: { apply perm_skip. apply perm_swap. } (* [2; 1; 3] ~ [2; 3; 1] *)
+      apply perm_swap. } (* [1; 2; 3] ~ [2; 1; 3] *)
+    
+    split.
+    (* 5a. IPv4 multicast true *)
+    { reflexivity. }
+    
+    split.
+    (* 5b. IPv4 non-multicast *)
+    { reflexivity. }
+    
+    split.
+    (* 6. IPv6 multicast *)
+    { reflexivity. }
+    
+split.
+    (* 7. Maximum size encoding *)
+    { destruct (encode_maximum_datagram_ok defaults_ipv4 test_src_v4 test_dst_v4 12345 53) 
+        as [wire [Henc _]].
+      exists wire. exact Henc. }
+    
+    (* 8. Decoder exhaustiveness *)
+    { intro wire. apply decode_never_stuck. }
+  Qed.
+
+End UDP_Grand_Unified_Example.
+
+
+
 (** ****************************************************************************
    
    RFC 768 UDP/IPv4 Formal Verification in Coq
@@ -4957,4 +5048,3 @@ End UDP_Serialization_Extras.
    has mathematically proven correctness for all UDP packet handling.
    
    **************************************************************************** *)
- 
