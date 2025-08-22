@@ -126,14 +126,15 @@ Definition word16_of_be (hi lo: byte) : word16 :=
 Lemma div256_lt256 :
   forall w, w < two16 -> (w / two8) < two8.
 Proof.
-  intros w Hw. 
-  unfold two8, two16 in *.
-  assert (w <= 65535) by lia.
-  assert (w / 256 <= 65535 / 256) by (apply N.div_le_mono; lia).
-  assert (65535 / 256 = 255) by reflexivity.
-  rewrite H1 in H0.
-  lia.
+  intros w Hw.
+  assert (two8 <> 0) by (cbv [two8]; lia).
+  (* w < 2^16 ⇒ w / 256 ≤ 65535/256 = 255 *)
+  pose proof (N.div_lt_upper_bound w two8 two8) as Hbound; cbv [two8] in *; try lia.
+  (* Alternatively: use N.div_lt with a positive divisor *)
+  apply N.div_lt_upper_bound; [cbv [two8]; lia|].
+  cbv [two16 two8] in *. lia.
 Qed.
+
 
 Lemma word16_of_be_be16 :
   forall w, w < two16 ->
@@ -4862,6 +4863,28 @@ Qed.
 
 End UDP_ModCarry_Equivalence.
 
+(* Round‑trip for BE16 under < 2^16 *)
+Lemma words16_bytes16_roundtrip :
+  forall ws, Forall (fun w => w < two16) ws ->
+  words16_of_bytes_be (bytes_of_words16_be ws) = ws.
+Proof.
+  induction ws as [|w tl IH]; intros H; simpl; [reflexivity|].
+  inversion H as [|? ? Hw Htl]; clear H.
+  unfold be16_of_word16.
+  rewrite to_word16_id_if_lt by exact Hw.
+  (* Now your existing word16_of_be_be16 / normalize lemmas close it *)
+  rewrite word16_of_be_reconstruct by auto.
+  f_equal. apply IH. exact Htl.
+Qed.
+
+(* Length of words16_of_bytes_be: ceil(|bs|/2) *)
+Lemma lenN_words16_of_bytes_be :
+  forall bs, lenN (words16_of_bytes_be bs) = (lenN bs + 1) / 2.
+Proof.
+  induction bs as [|b0 [|b1 tl] IH]; simpl; try reflexivity.
+  - cbv; lia.
+  - rewrite IH. cbv; lia.
+Qed.
 
 
 
