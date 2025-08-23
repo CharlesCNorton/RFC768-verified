@@ -4914,153 +4914,279 @@ Qed.
 
 End UDP_Serialization_Extras.
 
-Section UDP_Grand_Unified_Example.
+Section UDP_Full_Pipeline_Implementation.
   Open Scope N_scope.
 
-  (* Test data and addresses *)
-  Definition test_src_v4 := mkIPv4 10 0 0 1.
-  Definition test_dst_v4 := mkIPv4 10 0 0 2.
-  Definition test_src_v6 := mkIPv6 0x2001 0x0db8 0 0 0 0 0 1.
-  Definition test_dst_v6 := mkIPv6 0x2001 0x0db8 0 0 0 0 0 2.
-  Definition small_data : list byte := [1; 2; 3].
+  (* Historic ARPANET message "LO" *)
+  Definition msg_L : byte := 76.  (* ASCII 'L' *)
+  Definition msg_O : byte := 79.  (* ASCII 'O' *)
+  Definition arpanet_payload := [msg_L; msg_O].
+  
+  (* UCLA (10.0.0.1) to SRI (10.0.0.2) *)
+  Definition ucla_ip := mkIPv4 10 0 0 1.
+  Definition sri_ip := mkIPv4 10 0 0 2.
+  
+  (* Year of ARPANET: 1969 *)
+  Definition arpanet_sp : word16 := 1969.
+  
+  (* Telnet port: 23 *)
+  Definition telnet_dp : word16 := 23.
 
-  (* Fully Proven Comprehensive Example *)
-  Theorem UDP_Complete_Proven_Example :
-    (* 1. Source port 0 handling *)
-    (exists wire,
-       encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 0 53 small_data = Ok wire /\
-       decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire = Ok (0, 53, small_data)) /\
+  (* Step 1: Build the header with zero checksum *)
+  Definition header_zero_ck := {|
+    src_port := arpanet_sp;
+    dst_port := telnet_dp;
+    length16 := 10;  (* 8 header + 2 payload *)
+    checksum := 0
+  |}.
+
+  (* Step 2: Build the pseudo-header for checksum computation *)
+  Definition pseudo := pseudo_header_v4 ucla_ip sri_ip 10.
+  
+  (* Step 3: Checksum material = pseudo + header + data as 16-bit words *)
+  Definition checksum_material := 
+    pseudo ++ udp_header_words_zero_ck header_zero_ck ++ words16_of_bytes_be arpanet_payload.
+
+  (* Step 4: Actually compute the checksum *)
+  Definition computed_checksum := cksum16 checksum_material.
+  
+  (* Step 5: Apply the 0x0000 -> 0xFFFF rule *)
+  Definition final_checksum := 
+    if N.eqb computed_checksum 0 then mask16 else computed_checksum.
+
+  (* Step 6: Build the final header with checksum *)
+  Definition final_header := {|
+    src_port := arpanet_sp;
+    dst_port := telnet_dp;
+    length16 := 10;
+    checksum := final_checksum
+  |}.
+
+  (* Step 7: Serialize to bytes *)
+  Definition packet_bytes := udp_header_bytes final_header ++ arpanet_payload.
+
+  (* Now prove this entire pipeline is correct *)
+  Theorem Full_Pipeline_Correctness :
+    (* Our manually constructed packet *)
+    let manual_packet := packet_bytes in
     
-    (* 2. Oversize rejection *)
-    encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 12345 53 (bytes_n n_over) = Err Oversize /\
-    
-    (* 3. Zero checksum accepted in IPv4 *)
-    decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 
-      (udp_header_bytes {| src_port := 12345; dst_port := 53; length16 := 11; checksum := 0 |} ++ small_data) = 
-      Ok (12345, 53, small_data) /\
-    
-    (* 4. Checksum permutation invariance *)
-    cksum16 [1; 2; 3] = cksum16 [3; 2; 1] /\
-    
-    (* 5. Multicast detection *)
-    is_multicast_ipv4 (mkIPv4 224 0 0 1) = true /\
-    is_multicast_ipv4 test_dst_v4 = false /\
-    
-    (* 6. IPv6 multicast detection *)
-    is_multicast_ipv6 (mkIPv6 0xFF02 0 0 0 0 0 0 1) = true /\
-    
-    (* 7. Maximum valid size encoding succeeds *)
-    (exists wire, encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 12345 53 (bytes_n max_udp_data_size) = Ok wire) /\
-    
-    (* 8. Decoder exhaustiveness *)
-    (forall wire, exists r, decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire = r).
+    (* The encoder's packet *)
+    exists encoder_packet,
+      (* 1. The encoder produces the same packet *)
+      encode_udp_ipv4 defaults_ipv4 ucla_ip sri_ip arpanet_sp telnet_dp arpanet_payload = Ok encoder_packet /\
+      encoder_packet = manual_packet /\
+      
+      (* 2. The packet has exactly 10 bytes *)
+      lenN manual_packet = 10 /\
+      
+      (* 3. The checksum is non-zero *)
+      final_checksum <> 0 /\
+      
+      (* 4. The packet decodes correctly *)
+      decode_udp_ipv4 defaults_ipv4 ucla_ip sri_ip manual_packet = 
+        Ok (arpanet_sp, telnet_dp, arpanet_payload) /\
+      
+      (* 5. The exact byte layout is: *)
+      (* [0x07, 0xB1,  -- source port 1969 (0x07B1) big-endian
+          0x00, 0x17,  -- dest port 23 (0x0017) big-endian  
+          0x00, 0x0A,  -- length 10 (0x000A) big-endian
+          ck_hi, ck_lo, -- checksum big-endian
+          0x4C, 0x4F]  -- 'L', 'O' *) 
+      (exists ck_hi ck_lo,
+        manual_packet = [
+          7; 177;      (* 1969 = 0x07B1 *)
+          0; 23;       (* 23 = 0x0017 *)
+          0; 10;       (* 10 = 0x000A *)
+          ck_hi; ck_lo;
+          76; 79       (* 'L', 'O' *)
+        ] /\
+        word16_of_be ck_hi ck_lo = final_checksum) /\
+      
+(* 6. Verify checksum computation step by step *)
+checksum_material = [
+  (* Pseudo-header *)
+  10 * 256 + 0;    (* src IP high *)
+  0 * 256 + 1;     (* src IP low *)
+  10 * 256 + 0;    (* dst IP high *)
+  0 * 256 + 2;     (* dst IP low *)
+  17;              (* word16_of_be 0 17 = 0*256 + 17 = 17 *)
+  10;              (* length *)
+  (* UDP header with zero checksum *)
+  1969;            (* src port *)
+  23;              (* dst port *)
+  10;              (* length again *)
+  0;               (* zero checksum *)
+  (* Payload as 16-bit words *)
+  76 * 256 + 79    (* 'LO' *)
+] /\
+      
+      (* 7. The actual checksum value can be computed *)
+      final_checksum = compute_udp_checksum_ipv4 ucla_ip sri_ip header_zero_ck arpanet_payload.
 
   Proof.
-    split.
-    (* 1. Source port 0 *)
-    { apply roundtrip_source_port_zero.
-      - intro H; vm_compute in H; discriminate.
-      - simpl. vm_compute. discriminate. }
+    simpl.
+    
+    (* First establish the encoder produces a packet *)
+    assert (Hmk: mk_header arpanet_sp telnet_dp (lenN arpanet_payload) = Some header_zero_ck).
+    { unfold mk_header, arpanet_sp, telnet_dp, arpanet_payload. simpl. reflexivity. }
+    
+    assert (Henc_exists: exists w, encode_udp_ipv4 defaults_ipv4 ucla_ip sri_ip arpanet_sp telnet_dp arpanet_payload = Ok w).
+    { unfold encode_udp_ipv4. rewrite Hmk. simpl. eexists. reflexivity. }
+    destruct Henc_exists as [encoder_packet Henc].
+    
+    exists encoder_packet.
     
     split.
-    (* 2. Oversize *)
-    { apply EX_encode_oversize_at_boundary. }
-    
-    split.
-    (* 3. Zero checksum accepted *)
-    { reflexivity. }
-    
-    split.
-(* 4. Checksum permutation *)
-    { apply cksum16_perm.
-      eapply perm_trans.
-      2: { apply perm_swap. } (* [2; 3; 1] ~ [3; 2; 1] *)
-      eapply perm_trans.
-      2: { apply perm_skip. apply perm_swap. } (* [2; 1; 3] ~ [2; 3; 1] *)
-      apply perm_swap. } (* [1; 2; 3] ~ [2; 1; 3] *)
-    
-    split.
-    (* 5a. IPv4 multicast true *)
-    { reflexivity. }
-    
-    split.
-    (* 5b. IPv4 non-multicast *)
-    { reflexivity. }
-    
-    split.
-    (* 6. IPv6 multicast *)
-    { reflexivity. }
-    
-split.
-    (* 7. Maximum size encoding *)
-    { destruct (encode_maximum_datagram_ok defaults_ipv4 test_src_v4 test_dst_v4 12345 53) 
-        as [wire [Henc _]].
-      exists wire. exact Henc. }
-    
-    (* 8. Decoder exhaustiveness *)
-    { intro wire. apply decode_never_stuck. }
-  Qed.
-
-End UDP_Grand_Unified_Example.
-
-Section UDP_Fiendish_Application.
-  Open Scope N_scope.
-
-  Theorem UDP_Fiendish_Scenario :
-    exists wire0 wire_max wire_broken,
-      (* 1. Port 0 packet exists and decodes correctly *)
-      encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 0 53 small_data = Ok wire0 /\
-      decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire0 = Ok (0, 53, small_data) /\
+    - (* Encoder produces packet *) exact Henc.
+    - (* Rest of the goals *)
+      split.
+      + (* Packets are equal *)
+        unfold encode_udp_ipv4 in Henc.
+        rewrite Hmk in Henc.
+        simpl in Henc.
+        inversion Henc; subst encoder_packet; clear Henc.
+        reflexivity.
       
-      (* 2. Maximum size packet exists *)
-      encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 12345 53 (bytes_n max_udp_data_size) = Ok wire_max /\
-      
-      (* 3. A "broken" packet with zero checksum still decodes *)
-      wire_broken = udp_header_bytes {| src_port := 0; dst_port := 53; length16 := 11; checksum := 0 |} ++ small_data /\
-      decode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 wire_broken = Ok (0, 53, small_data) /\
-      
-      (* 4. The checksums of permuted data are equal *)
-      cksum16 (words16_of_bytes_be small_data) = cksum16 (words16_of_bytes_be [3; 2; 1]) /\
-      
-      (* 5. Oversize by even 1 byte fails *)
-      encode_udp_ipv4 defaults_ipv4 test_src_v4 test_dst_v4 0 53 (bytes_n (mask16 - 7)) = Err Oversize /\
-      
-      (* 6. Both multicast detection results hold simultaneously *)
-      is_multicast_ipv4 (mkIPv4 224 0 0 1) = true /\
-      is_multicast_ipv6 (mkIPv6 0xFF02 0 0 0 0 0 0 1) = true.
+      + split.
+        * (* Length is 10 *)
+          unfold packet_bytes.
+          rewrite lenN_app, lenN_udp_header_bytes_8.
+          unfold arpanet_payload. simpl. reflexivity.
+        
+        * split.
+          -- (* Checksum non-zero *)
+             unfold final_checksum.
+             destruct (computed_checksum =? 0) eqn:E.
+             ++ unfold mask16. discriminate.
+             ++ apply N.eqb_neq in E. exact E.
+          
+          -- split.
+             ++ (* Decodes correctly *)
+                assert (Hdec_eq: decode_udp_ipv4 defaults_ipv4 ucla_ip sri_ip packet_bytes = 
+                                 Ok (to_word16 arpanet_sp, to_word16 telnet_dp, arpanet_payload)).
+                { apply decode_encode_roundtrip_ipv4_defaults_reject_nonzero16 with header_zero_ck.
+                  - unfold telnet_dp. intro H. vm_compute in H. discriminate.
+                  - exact Hmk.
+                  - unfold encode_udp_ipv4. rewrite Hmk. simpl. reflexivity. }
+                assert (arpanet_sp < two16) by (unfold arpanet_sp; vm_compute; constructor).
+                assert (telnet_dp < two16) by (unfold telnet_dp; vm_compute; constructor).
+                rewrite to_word16_id_if_lt in Hdec_eq by assumption.
+                rewrite to_word16_id_if_lt in Hdec_eq by assumption.
+                exact Hdec_eq.
+             
+             ++ split.
+                ** (* Exact byte layout *)
+                   unfold packet_bytes, final_header, udp_header_bytes.
+                   simpl.
+                   destruct (be16_of_word16 (to_word16 arpanet_sp)) as [sp_hi sp_lo] eqn:Esp.
+                   destruct (be16_of_word16 (to_word16 telnet_dp)) as [dp_hi dp_lo] eqn:Edp.
+                   destruct (be16_of_word16 (to_word16 10)) as [l_hi l_lo] eqn:El.
+                   destruct (be16_of_word16 (to_word16 final_checksum)) as [ck_hi ck_lo] eqn:Eck.
+                   
+                   (* Compute byte values for source port *)
+                   assert (Esp_calc: sp_hi = 7 /\ sp_lo = 177).
+                   { assert (H3: to_word16 arpanet_sp = arpanet_sp).
+                     { apply to_word16_id_if_lt. unfold arpanet_sp. vm_compute. constructor. }
+                     rewrite H3 in Esp.
+                     unfold arpanet_sp in Esp.
+                     assert (H1: be16_of_word16 1969 = (7, 177)) by (vm_compute; reflexivity).
+                     rewrite H1 in Esp.
+                     injection Esp as -> ->. split; reflexivity. }
+                   
+                   (* Compute byte values for dest port *)
+                   assert (Edp_calc: dp_hi = 0 /\ dp_lo = 23).
+                   { assert (H2: to_word16 telnet_dp = telnet_dp).
+                     { apply to_word16_id_if_lt. unfold telnet_dp. vm_compute. constructor. }
+                     rewrite H2 in Edp.
+                     unfold telnet_dp in Edp.
+                     assert (H3: be16_of_word16 23 = (0, 23)) by (vm_compute; reflexivity).
+                     rewrite H3 in Edp.
+                     injection Edp as -> ->. split; reflexivity. }
+                   
+                   (* Compute byte values for length *)
+                   assert (El_calc: l_hi = 0 /\ l_lo = 10).
+                   { assert (H2: to_word16 10 = 10) by (vm_compute; reflexivity).
+                     rewrite H2 in El.
+                     assert (H1: be16_of_word16 10 = (0, 10)) by (vm_compute; reflexivity).
+                     rewrite H1 in El.
+                     injection El as -> ->. split; reflexivity. }
+                   
+                   (* Destruct the calc results *)
+                   destruct Esp_calc as [Hsp_hi Hsp_lo].
+                   destruct Edp_calc as [Hdp_hi Hdp_lo].
+                   destruct El_calc as [Hl_hi Hl_lo].
+                   
+                   exists ck_hi, ck_lo.
+                   split.
+--- (* Show the exact byte layout *)
+    unfold udp_header_bytes, udp_header_words.
+    
+    (* Temporarily make bytes_of_words16_be transparent *)
+    Transparent bytes_of_words16_be.
+    simpl bytes_of_words16_be.
+    
+    (* Now the computation should expose the be16_of_word16 calls *)
+    simpl.
+    
+    (* Rewrite with our equations *)
+    rewrite Esp, Edp, El, Eck.
+    simpl.
+    
+    (* Now apply the concrete values *)
+    rewrite Hsp_hi, Hsp_lo, Hdp_hi, Hdp_lo, Hl_hi, Hl_lo.
+    
+    unfold arpanet_payload, msg_L, msg_O.
+    reflexivity.
+    
+    (* Make it opaque again if needed *)
+    Opaque bytes_of_words16_be.
+--- 
+    assert (Hfinal_lt: final_checksum < two16).
+    { unfold final_checksum.
+      destruct (computed_checksum =? 0).
+      - unfold mask16, two16. compute. constructor.
+      - apply cksum16_lt_two16. }
+    
+    pose proof (word16_of_be_be16 (to_word16 final_checksum) (to_word16_lt_two16 final_checksum)) as H.
+    rewrite Eck in H.
+    simpl in H.
+    rewrite H.
+    
+    rewrite to_word16_id_if_lt by exact Hfinal_lt.
+    reflexivity.
 
-  Proof.
-    pose proof UDP_Complete_Proven_Example as H.
-    destruct H as [H1 [H2 [H3 [H4 [H5a [H5b [H6 [H7 H8]]]]]]]].
-    
-    destruct H1 as [wire0 [Henc0 Hdec0]].
-    destruct H7 as [wire_max Henc_max].
-    
-    set (wire_broken := udp_header_bytes {| src_port := 0; dst_port := 53; length16 := 11; checksum := 0 |} ++ small_data).
-    
-    exists wire0, wire_max, wire_broken.
-    
-    split. exact Henc0.
-    split. exact Hdec0.
-    split. exact Henc_max.
-    split. reflexivity.
-    split. reflexivity.
-    split. unfold small_data. simpl. reflexivity.
-    split. exact H2.
-    split. exact H5a.
-    exact H6.
-  Qed.
+** split.
+--- 
+    unfold checksum_material, pseudo.
+    Transparent pseudo_header_v4 ipv4_words words16_of_bytes_be word16_of_be.
+    unfold pseudo_header_v4.
+    unfold udp_header_words_zero_ck, header_zero_ck.
+    unfold ipv4_words.
+    unfold ucla_ip, sri_ip, arpanet_sp, telnet_dp.
+    simpl.
+    unfold words16_of_bytes_be, arpanet_payload, msg_L, msg_O.
+    simpl.
+    unfold word16_of_be, udp_protocol_number.
+    compute.
+    reflexivity.
+    Opaque pseudo_header_v4 ipv4_words words16_of_bytes_be word16_of_be.
+--- (* Final checksum equals compute function *)
+    reflexivity.
+Qed.
 
-End UDP_Fiendish_Application.
+  Compute final_checksum.
+
+End UDP_Full_Pipeline_Implementation.
 
 (** ****************************************************************************
    
-   RFC 768 UDP/IPv4 Formal Verification in Coq
+   RFC 768 UDP/IPv4/IPv6 Formal Verification in Coq
    ============================================
    
-   This formalization provides the first comprehensive, machine-checked 
+   This formalization provides a comprehensive, machine-checked 
    verification of the User Datagram Protocol (UDP) as specified in RFC 768,
-   with extensions from RFC 1122/1812 for ICMP error handling.
+   with full IPv6 support (RFC 8200) and extensions from RFC 1122/1812 for 
+   ICMP error handling.
    
    ## Future Work
    
@@ -5096,4 +5222,4 @@ End UDP_Fiendish_Application.
    has mathematically proven correctness for all UDP packet handling.
    
    **************************************************************************** *)
- 
+     
