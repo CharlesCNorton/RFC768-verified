@@ -5178,6 +5178,215 @@ Qed.
 
 End UDP_Full_Pipeline_Implementation.
 
+(* ----------------------------------------------------------------------------
+   9) Hardened drop‑in: payload normalization + stricter zero‑checksum policy
+   ----------------------------------------------------------------------------
+
+   This section provides:
+     - A total byte normalizer for decoded payloads.
+     - IPv4 "hardened" configuration that forbids zero checksum on
+       multicast or broadcast destinations, enforces strict length equality,
+       and rejects destination port 0.
+     - Drop‑in decoder wrappers that *normalize payload bytes* so that
+       every element is in 0..255 even if the caller provided larger N values.
+
+   Usage:
+     - Prefer [ipv4_hardened_default] (or [ipv4_hardened_with my_is_broadcast])
+       as your Config for IPv4.
+     - Replace calls to [decode_udp_ipv4] with [decode_udp_ipv4_hardened].
+       If you use the address‑carrying variant, use
+       [decode_udp_ipv4_with_addrs_hardened].
+     - For IPv6, use [decode_udp_ipv6_hardened] to normalize payload bytes
+       (IPv6 already forbids zero checksum in the core decoder).
+
+   NOTE: Broadcast detection is host/topology specific. The configurable
+         [is_broadcast] predicate remains a parameter; the default here
+         conservatively treats no address as a broadcast.
+ *)
+
+(* Normalize a list of bytes by truncating each element modulo 256. *)
+Definition normalize_bytes (xs : list byte) : list byte :=
+  List.map to_byte xs.
+
+(* (Optional) Convenience lemma: normalized bytes are always in range. *)
+Lemma normalize_bytes_are_bytes :
+  forall xs, Forall (fun b => is_byte b = true) (normalize_bytes xs).
+Proof.
+  intros xs; induction xs as [|a xs IH]; simpl; constructor.
+  - unfold to_byte. apply is_byte_true_of_mod.
+  - exact IH.
+Qed.
+
+(* A hardened IPv4 configuration with stricter receive‑side policies. *)
+Definition ipv4_hardened_default : Config :=
+  {| checksum_tx_mode     := WithChecksum;
+     checksum_rx_mode     := ValidOrZero;
+     zero_checksum_policy := ZeroForbidOnMultiOrBcast;  (* forbid on multicast/broadcast *)
+     length_rx_mode       := StrictEq;                  (* enforce Nbytes = L *)
+     dst_port0_policy     := Reject;                    (* reject dp = 0 *)
+     is_broadcast         := fun _ => false |}.         (* supply your own if available *)
+
+(* Variant allowing a host‑specific broadcast predicate. *)
+Definition ipv4_hardened_with (is_bcast : IPv4 -> bool) : Config :=
+  {| checksum_tx_mode     := WithChecksum;
+     checksum_rx_mode     := ValidOrZero;
+     zero_checksum_policy := ZeroForbidOnMultiOrBcast;
+     length_rx_mode       := StrictEq;
+     dst_port0_policy     := Reject;
+     is_broadcast         := is_bcast |}.
+
+(* IPv4: hardened decoder that also normalizes the delivered payload bytes. *)
+Definition decode_udp_ipv4_hardened
+  (src_ip dst_ip : IPv4) (wire : list byte)
+  : result Decoded DecodeError :=
+  match decode_udp_ipv4 ipv4_hardened_default src_ip dst_ip wire with
+  | inl (sp, dp, data) => Ok (sp, dp, normalize_bytes data)
+  | inr e => Err e
+  end.
+
+(* IPv4: address‑carrying hardened decoder with normalized payload. *)
+Definition decode_udp_ipv4_with_addrs_hardened
+  (src_ip dst_ip : IPv4) (wire : list byte)
+  : result UdpDeliver DecodeError :=
+  match decode_udp_ipv4 ipv4_hardened_default src_ip dst_ip wire with
+  | inl (sp, dp, data) =>
+      Ok {| src_ip_out   := src_ip
+          ; dst_ip_out   := dst_ip
+          ; src_port_out := sp
+          ; dst_port_out := dp
+          ; payload_out  := normalize_bytes data |}
+  | inr e => Err e
+  end.
+
+(* IPv6: decoder wrapper that normalizes the delivered payload bytes. *)
+Definition decode_udp_ipv6_hardened
+  (src_ip dst_ip : IPv6) (wire : list byte)
+  : result Decoded DecodeError :=
+  match decode_udp_ipv6 src_ip dst_ip wire with
+  | inl (sp, dp, data) => Ok (sp, dp, normalize_bytes data)
+  | inr e => Err e
+  end.
+  
+Section UDP_Hardened_Examples.
+  Open Scope N_scope.
+
+  (* A tiny payload "HI" *)
+  Definition msg_H : byte := 72.  (* 'H' *)
+  Definition msg_I : byte := 73.  (* 'I' *)
+  Definition payload_HI := [msg_H; msg_I].
+
+  (* Hosts *)
+  Definition srcA := mkIPv4 10 0 0 100.
+  Definition dstB := mkIPv4 10 0 0 200.
+
+  (* Ports *)
+  Definition p_src : word16 := 1969.
+  Definition p_dst : word16 := 23.
+
+  (****************************************************************)
+  (* 1) HARDENING: zero-checksum to broadcast is rejected          *)
+  (****************************************************************)
+
+  (* Treat 10.0.0.255 as a broadcast address *)
+  Definition dstB_broadcast := mkIPv4 10 0 0 255.
+
+Definition is_bcast_10_0_0_255 (ip : IPv4) : bool :=
+  match ip with
+  | Build_IPv4 a b c d =>
+      N.eqb a 10 && N.eqb b 0 && N.eqb c 0 && N.eqb d 255
+  end.
+
+  Definition cfg_hardened_bcast := ipv4_hardened_with is_bcast_10_0_0_255.
+
+  (* Build a UDP header that *claims* length 10 and has a zero checksum *)
+  Definition hdr_zero_ck_bcast : UdpHeader :=
+    {| src_port := p_src; dst_port := p_dst; length16 := 10; checksum := 0 |}.
+
+  (* Wire = header (with checksum=0) ++ payload (2 bytes) *)
+  Definition wire_zero_ck_bcast : list byte :=
+    udp_header_bytes hdr_zero_ck_bcast ++ payload_HI.
+
+  (* Under hardened policy with broadcast detection, this must be an error. *)
+  Example Hardened_rejects_zero_ck_on_broadcast :
+    exists e, decode_udp_ipv4 cfg_hardened_bcast srcA dstB_broadcast wire_zero_ck_bcast = Err e.
+  Proof. eexists; vm_compute; reflexivity. Qed.
+
+  (* For comparison: with the default "no broadcast knowledge" hardened config,
+     the same zero checksum would be *allowed* (because zero is allowed
+     for unicast and is_broadcast = (fun _ => false)). *)
+  Example Hardened_default_allows_zero_ck_for_unicast :
+    decode_udp_ipv4 ipv4_hardened_default srcA dstB wire_zero_ck_bcast
+    = Ok (to_word16 p_src, to_word16 p_dst, payload_HI).
+  Proof. vm_compute; reflexivity. Qed.
+
+  (****************************************************************)
+  (* 2) HARDENING: payload bytes are normalized (mod 256)          *)
+  (****************************************************************)
+
+  (* Compute a correct non-zero checksum for payload_HI. *)
+  Definition hdr_zero_ck_norm : UdpHeader :=
+    {| src_port := p_src; dst_port := p_dst; length16 := 10; checksum := 0 |}.
+
+  Definition pseudo_norm := pseudo_header_v4 srcA dstB 10.
+  Definition checksum_material_norm :=
+    pseudo_norm ++ udp_header_words_zero_ck hdr_zero_ck_norm ++ words16_of_bytes_be payload_HI.
+  Definition computed_checksum_norm := cksum16 checksum_material_norm.
+  Definition final_checksum_norm :=
+    if N.eqb computed_checksum_norm 0 then mask16 else computed_checksum_norm.
+
+  Definition hdr_final_norm : UdpHeader :=
+    {| src_port := p_src; dst_port := p_dst; length16 := 10; checksum := final_checksum_norm |}.
+
+  (* "Good" wire produced for payload_HI *)
+  Definition wire_good_norm : list byte :=
+    udp_header_bytes hdr_final_norm ++ payload_HI.
+
+  (* Attack variant: same header, but payload bytes outside [0,255].
+     Because UDP checksum math uses modulo-256 bytes internally, the
+     checksum still validates on decode — but a hardened wrapper
+     will normalize the delivered payload back into [0,255]. *)
+  Definition payload_out_of_range := [msg_H + 256; msg_I + 256].  (* 328, 329 *)
+  Definition wire_bad_norm : list byte :=
+    udp_header_bytes hdr_final_norm ++ payload_out_of_range.
+
+  (* Baseline decoder (no normalization): returns out-of-range bytes as-is. *)
+  Example Baseline_decoder_leaks_out_of_range_bytes :
+    decode_udp_ipv4 ipv4_hardened_default srcA dstB wire_bad_norm
+    = Ok (to_word16 p_src, to_word16 p_dst, payload_out_of_range).
+  Proof. vm_compute; reflexivity. Qed.
+
+  (* Hardened wrapper: normalizes payload bytes (mod 256). *)
+  Example Hardened_decoder_normalizes_payload_bytes :
+    decode_udp_ipv4_hardened srcA dstB wire_bad_norm
+    = Ok (to_word16 p_src, to_word16 p_dst, [msg_H; msg_I]).
+  Proof. vm_compute; reflexivity. Qed.
+
+  (****************************************************************)
+  (* 3) HARDENING: strict length equality rejects overlong IP data *)
+  (****************************************************************)
+
+  (* Overlong IP payload: header says length=10, but 11 bytes provided. *)
+  Definition wire_overlong : list byte := wire_good_norm ++ [0].
+
+  (* Hardened (StrictEq) must reject. *)
+  Example Hardened_rejects_overlong_payload :
+    exists e, decode_udp_ipv4 ipv4_hardened_default srcA dstB wire_overlong = Err e.
+  Proof. eexists; vm_compute; reflexivity. Qed.
+
+  (* If you keep or expose a permissive config with AcceptShorter semantics,
+     the same overlong wire should succeed and deliver only the first (L-8)
+     bytes of payload. If your file defines [defaults_ipv4_acceptShorter],
+     you can uncomment the following to see the contrast:
+
+     Example Permissive_accepts_overlong_and_truncates :
+       decode_udp_ipv4 defaults_ipv4_acceptShorter srcA dstB wire_overlong
+       = Ok (to_word16 p_src, to_word16 p_dst, payload_HI).
+     Proof. vm_compute; reflexivity. Qed.
+   *)
+
+End UDP_Hardened_Examples.
+
+
 (** ****************************************************************************
    
    RFC 768 UDP/IPv4/IPv6 Formal Verification in Coq
@@ -5222,4 +5431,3 @@ End UDP_Full_Pipeline_Implementation.
    has mathematically proven correctness for all UDP packet handling.
    
    **************************************************************************** *)
-     
