@@ -6906,7 +6906,437 @@ Section UDP_PathMTU.
 
 End UDP_PathMTU.
 
-(* Final Comprehensive Extraction to OCaml *)
+Section UDP_ICMP_Generation.
+  Open Scope N_scope.
+
+  (* ICMP message type values *)
+  Definition ICMP_TYPE_DEST_UNREACHABLE : byte := 3.
+  Definition ICMP_TYPE_TIME_EXCEEDED : byte := 11.
+  Definition ICMP_TYPE_PARAMETER_PROBLEM : byte := 12.
+  
+  (* ICMP codes for destination unreachable *)
+  Definition ICMP_CODE_NET_UNREACHABLE : byte := 0.
+  Definition ICMP_CODE_HOST_UNREACHABLE : byte := 1.
+  Definition ICMP_CODE_PROTOCOL_UNREACHABLE : byte := 2.
+  Definition ICMP_CODE_PORT_UNREACHABLE : byte := 3.
+  Definition ICMP_CODE_FRAGMENTATION_NEEDED : byte := 4.
+
+  (* Generate ICMP Port Unreachable when no socket listening *)
+  Definition generate_icmp_port_unreachable (src dst : IPv4) 
+                                           (rejected_packet : list byte)
+    : list byte :=
+    (* ICMP includes IP header + 8 bytes of original packet *)
+    let original_to_include := take 28 rejected_packet in
+    
+    (* Build ICMP message body *)
+    let icmp_body := [ICMP_TYPE_DEST_UNREACHABLE; ICMP_CODE_PORT_UNREACHABLE]
+                     ++ [0; 0]  (* Checksum placeholder *)
+                     ++ [0; 0; 0; 0]  (* Unused field *)
+                     ++ original_to_include in
+    
+    (* Compute ICMP checksum *)
+    let checksum := cksum16 (words16_of_bytes_be icmp_body) in
+    
+    (* Build complete ICMP packet with correct checksum *)
+    [ICMP_TYPE_DEST_UNREACHABLE; ICMP_CODE_PORT_UNREACHABLE]
+    ++ bytes_of_words16_be [checksum]
+    ++ [0; 0; 0; 0]
+    ++ original_to_include.
+
+  (* Build complete IP packet with ICMP *)
+  Definition build_icmp_ip_packet (src dst : IPv4) (icmp_payload : list byte) : list byte :=
+    let version_ihl := 69 in  (* Version 4, IHL 5 (20 bytes) *)
+    let tos := 0 in
+    let total_len := 20 + lenN icmp_payload in
+    let ident := 0 in
+    let flags_frag := 0 in
+    let ttl := 64 in
+    let protocol := 1 in  (* ICMP protocol number *)
+    let checksum := 0 in  (* Compute separately *)
+    
+    let ip_hdr := [version_ihl; tos]
+                  ++ bytes_of_words16_be [to_word16 total_len]
+                  ++ bytes_of_words16_be [to_word16 ident]
+                  ++ bytes_of_words16_be [to_word16 flags_frag]
+                  ++ [ttl; protocol]
+                  ++ bytes_of_words16_be [to_word16 checksum]
+                  ++ [src.(a0); src.(a1); src.(a2); src.(a3)]
+                  ++ [dst.(a0); dst.(a1); dst.(a2); dst.(a3)] in
+    
+    let ip_checksum := cksum16 (words16_of_bytes_be ip_hdr) in
+    let ip_hdr_complete := take 10 ip_hdr
+                          ++ bytes_of_words16_be [ip_checksum]
+                          ++ drop 12 ip_hdr in
+    ip_hdr_complete ++ icmp_payload.
+
+  (* Extended receive processing with ICMP generation *)
+  Definition process_udp_rx_with_icmp (stack : NetworkStack) 
+                                      (src dst : IPv4) 
+                                      (udp_data : list byte)
+    : NetworkStack * option (list byte) :=
+    match decode_udp_ipv4 defaults_ipv4 src dst udp_data with
+    | inl (src_port, dst_port, payload) =>
+        (* Try to deliver to socket *)
+        let delivered := 
+          fold_left (fun acc s => 
+                      orb acc (match deliver_to_socket s src src_port dst dst_port payload with
+                              | Some _ => true
+                              | None => false
+                              end))
+                    stack.(sockets) false in
+        if delivered
+        then (stack, None)  (* Successfully delivered *)
+        else 
+          (* No listening socket, generate ICMP *)
+          let icmp_msg := generate_icmp_port_unreachable dst src udp_data in
+          let icmp_packet := build_icmp_ip_packet dst src icmp_msg in
+          (stack, Some icmp_packet)
+    | inr _ => (stack, None)  (* Bad packet, drop silently *)
+    end.
+
+  (* Send ICMP through network interface *)
+  Definition send_icmp_response (stack : NetworkStack) (icmp_packet : list byte) (dst : IPv4)
+    : NetworkStack :=
+    match find_route stack dst with
+    | None => stack
+    | Some (iface, _) => send_packet stack iface.(if_index) icmp_packet
+    end.
+
+  (* Complete receive handler with ICMP generation *)
+  Definition receive_udp_with_icmp (stack : NetworkStack) (if_idx : N)
+    : NetworkStack :=
+    match receive_packet stack if_idx with
+    | None => stack
+    | Some (packet, stack') =>
+        (* Parse IP header to get src/dst *)
+        match packet with
+        | _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: _
+          :: s0 :: s1 :: s2 :: s3
+          :: d0 :: d1 :: d2 :: d3 :: rest =>
+            let src := mkIPv4 s0 s1 s2 s3 in
+            let dst := mkIPv4 d0 d1 d2 d3 in
+            let (stack'', icmp_opt) := process_udp_rx_with_icmp stack' src dst rest in
+            match icmp_opt with
+            | None => stack''
+            | Some icmp => send_icmp_response stack'' icmp src
+            end
+        | _ => stack'  (* Malformed packet *)
+        end
+    end.
+
+  (* Rate limit ICMP responses to prevent abuse *)
+  Record ICMPRateLimit := {
+    icmp_tokens : N;
+    icmp_last_refill : N;
+    icmp_rate : N  (* ICMP packets per second *)
+  }.
+
+  Definition should_send_icmp_rl (rl : ICMPRateLimit) (now : N) : bool * ICMPRateLimit :=
+    let elapsed := now - rl.(icmp_last_refill) in
+    let new_tokens := N.min 10 (rl.(icmp_tokens) + (elapsed * rl.(icmp_rate))) in
+    if N.ltb 0 new_tokens
+    then (true, {| icmp_tokens := new_tokens - 1;
+                   icmp_last_refill := now;
+                   icmp_rate := rl.(icmp_rate) |})
+    else (false, {| icmp_tokens := new_tokens;
+                    icmp_last_refill := now;
+                    icmp_rate := rl.(icmp_rate) |}).
+
+End UDP_ICMP_Generation.
+
+Section UDP_Jumbogram.
+  Open Scope N_scope.
+
+  (* IPv6 Hop-by-Hop Options *)
+  Definition IPV6_HOP_BY_HOP : byte := 0.
+  Definition IPV6_OPTION_JUMBO : byte := 194.  (* 0xC2 - Jumbo Payload Option *)
+  
+  (* Maximum sizes *)
+  Definition MAX_NORMAL_PAYLOAD : N := 65535.
+  Definition MAX_JUMBO_PAYLOAD : N := 4294967295.  (* 2^32 - 1 *)
+
+  (* Jumbo Payload Option structure *)
+  Record JumboOption := {
+    opt_type : byte;      (* 194 for Jumbo *)
+    opt_length : byte;    (* 4 for Jumbo *)
+    jumbo_length : N      (* 32-bit payload length *)
+  }.
+
+  (* Parse Hop-by-Hop header for Jumbo option *)
+  Fixpoint parse_options_aux (opts : list byte) (fuel : nat) : option N :=
+    match fuel with
+    | O => None  (* Out of fuel *)
+    | S fuel' =>
+        match opts with
+        | [] => None
+        | 0 :: rest' => parse_options_aux rest' fuel'  (* Pad1 option *)
+        | 1 :: len :: rest' => parse_options_aux (drop (N.to_nat len) rest') fuel'  (* PadN option *)
+        | 194 :: 4 :: b0 :: b1 :: b2 :: b3 :: rest' =>
+            (* Jumbo Payload Option found *)
+            Some ((b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3)
+        | _ :: len :: rest' => parse_options_aux (drop (N.to_nat len) rest') fuel'  (* Unknown option *)
+        | _ => None
+        end
+    end.
+
+  Definition parse_hop_by_hop (data : list byte) : option N :=
+    match data with
+    | next :: hdr_len :: rest =>
+        (* hdr_len is in 8-byte units, not counting first 8 bytes *)
+        let total_len := (hdr_len + 1) * 8 in
+        parse_options_aux (drop 2 rest) (N.to_nat total_len)
+    | _ => None
+    end.
+
+  (* Build Hop-by-Hop header with Jumbo option *)
+  Definition build_jumbo_hop_by_hop (payload_length : N) : list byte :=
+    let next_header := 17 in  (* UDP *)
+    let hdr_ext_len := 0 in   (* 0 means 8 bytes total *)
+    let jumbo_bytes := [(payload_length / 16777216) mod 256;
+                        (payload_length / 65536) mod 256;
+                        (payload_length / 256) mod 256;
+                        payload_length mod 256] in
+    [next_header; hdr_ext_len; IPV6_OPTION_JUMBO; 4] ++ jumbo_bytes.
+
+  (* Extended network stack with jumbo capability tracking *)
+  Record NetworkStackJumbo := {
+    jumbo_base : NetworkStack;
+    jumbo_paths : list (IPv6 * N * N);  (* destination, max_jumbo_size, last_probe_time *)
+    jumbo_probe_interval : N
+  }.
+
+  (* Helper to compare IPv6 addresses *)
+  Definition ipv6_eq (a b : IPv6) : bool :=
+    andb (andb (andb (N.eqb a.(v6_0) b.(v6_0))
+                     (N.eqb a.(v6_1) b.(v6_1)))
+              (andb (N.eqb a.(v6_2) b.(v6_2))
+                   (N.eqb a.(v6_3) b.(v6_3))))
+         (andb (andb (N.eqb a.(v6_4) b.(v6_4))
+                    (N.eqb a.(v6_5) b.(v6_5)))
+              (andb (N.eqb a.(v6_6) b.(v6_6))
+                   (N.eqb a.(v6_7) b.(v6_7)))).
+
+(* Probe path for jumbo support using binary search *)
+  Definition probe_jumbo_support (stack : NetworkStackJumbo) (dst : IPv6) (current_time : N)
+    : N * NetworkStackJumbo :=
+    let fix find_cached (paths : list (IPv6 * N * N)) : option (N * N) :=
+      match paths with
+      | [] => None
+      | (d, size, time) :: rest =>
+          if ipv6_eq d dst
+          then Some (size, time)
+          else find_cached rest
+      end in
+    match find_cached stack.(jumbo_paths) with
+    | Some (cached_size, last_probe) =>
+        if N.ltb (current_time - last_probe) stack.(jumbo_probe_interval)
+        then (cached_size, stack)  (* Use cached value *)
+        else
+          (* Time to re-probe, start with binary search *)
+          let min_size := 1500 in
+          let max_size := 65535 in
+          let probe_size := (min_size + max_size) / 2 in
+          let new_paths := (dst, probe_size, current_time) :: 
+                          filter (fun entry => 
+                                   match entry with
+                                   | (d, _, _) => negb (ipv6_eq d dst)
+                                   end)
+                                stack.(jumbo_paths) in
+          (probe_size, {| jumbo_base := stack.(jumbo_base);
+                         jumbo_paths := new_paths;
+                         jumbo_probe_interval := stack.(jumbo_probe_interval) |})
+    | None =>
+        (* No cached entry, start probing at 9000 (common jumbo size) *)
+        let initial_probe := 9000 in
+        let new_paths := (dst, initial_probe, current_time) :: stack.(jumbo_paths) in
+        (initial_probe, {| jumbo_base := stack.(jumbo_base);
+                          jumbo_paths := new_paths;
+                          jumbo_probe_interval := stack.(jumbo_probe_interval) |})
+    end.
+    
+  (* Update jumbo path cache based on success/failure *)
+  Definition update_jumbo_cache (stack : NetworkStackJumbo) (dst : IPv6) 
+                                (size : N) (success : bool) (current_time : N)
+    : NetworkStackJumbo :=
+    let fix update_paths (paths : list (IPv6 * N * N)) : list (IPv6 * N * N) :=
+      match paths with
+      | [] => [(dst, if success then size else size / 2, current_time)]
+      | (d, cached_size, _) :: rest =>
+          if ipv6_eq d dst
+          then
+            if success
+            then
+              (* Success - try larger next time *)
+              (d, N.min (size * 2) MAX_JUMBO_PAYLOAD, current_time) :: rest
+            else
+              (* Failure - reduce by half *)
+              (d, size / 2, current_time) :: rest
+          else (d, cached_size, current_time) :: update_paths rest
+      end in
+    {| jumbo_base := stack.(jumbo_base);
+       jumbo_paths := update_paths stack.(jumbo_paths);
+       jumbo_probe_interval := stack.(jumbo_probe_interval) |}.
+
+  (* Extend JumboError with decode errors *)
+  Inductive JumboError :=
+    | Packet_Too_Large
+    | Invalid_Extension_Header
+    | Invalid_Jumbo_Header
+    | Invalid_Next_Header
+    | Header_Too_Short
+    | Bad_Checksum
+    | Length_Mismatch.
+
+(* Encode UDP over IPv6 with Jumbogram support *)
+  Definition encode_udp_ipv6_jumbo (src dst : IPv6)
+                                   (src_port dst_port : word16)
+                                   (payload : list byte)
+    : JumboError + list byte :=
+    let udp_length := 8 + lenN payload in
+    
+    if N.leb udp_length MAX_NORMAL_PAYLOAD
+    then 
+      (* Normal packet - build it directly *)
+      let udp_header := {| src_port := src_port;
+                          dst_port := dst_port;
+                          length16 := to_word16 udp_length;
+                          checksum := 0 |} in
+      let pseudo := pseudo_header_v6 src dst udp_length in
+      let checksum := compute_udp_checksum_ipv6 src dst udp_header payload in
+      let final_header := {| src_port := src_port;
+                            dst_port := dst_port;
+                            length16 := to_word16 udp_length;
+                            checksum := checksum |} in
+      inr (udp_header_bytes final_header ++ payload)
+    else if N.leb udp_length MAX_JUMBO_PAYLOAD
+    then
+      (* Need Jumbogram *)
+      let udp_header := {| src_port := src_port;
+                          dst_port := dst_port;
+                          length16 := 0;  (* 0 means jumbogram *)
+                          checksum := 0 |} in
+      
+      (* Build Hop-by-Hop header *)
+      let hop_by_hop := build_jumbo_hop_by_hop udp_length in
+      
+      (* Compute checksum with jumbo pseudo-header *)
+      let pseudo := ipv6_words src ++ ipv6_words dst ++
+                    [to_word16 (udp_length / 65536); to_word16 (udp_length mod 65536)] ++
+                    [0; 17] in  (* UDP protocol *)
+      let checksum := cksum16 (pseudo ++ udp_header_words udp_header ++ 
+                               words16_of_bytes_be payload) in
+      
+      let final_header := {| src_port := src_port;
+                            dst_port := dst_port;
+                            length16 := 0;  (* Indicates jumbogram *)
+                            checksum := checksum |} in
+      
+      (* Build complete IPv6 packet with Hop-by-Hop *)
+      let version_class_flow := [96; 0; 0; 0] in  (* Version 6 *)
+      let next_header := IPV6_HOP_BY_HOP in
+      let hop_limit := 64 in
+      
+      inr (version_class_flow
+           ++ bytes_of_words16_be [0]  (* Payload length = 0 for jumbo *)
+           ++ [next_header; hop_limit]
+           ++ bytes_of_words16_be (ipv6_words src)
+           ++ bytes_of_words16_be (ipv6_words dst)
+           ++ hop_by_hop
+           ++ udp_header_bytes final_header
+           ++ payload)
+    else
+      inl Packet_Too_Large.
+      
+(* Decode UDP over IPv6 with Jumbogram support *)
+  Definition decode_udp_ipv6_jumbo (src dst : IPv6)
+                                   (next_header : byte)
+                                   (data : list byte)
+    : JumboError + (word16 * word16 * list byte) :=
+    if N.eqb next_header 0 then
+      (* Hop-by-Hop header present *)
+      match parse_hop_by_hop data with
+      | None => inl Invalid_Extension_Header
+      | Some jumbo_len =>
+          (* Skip Hop-by-Hop header to get to UDP *)
+          match data with
+          | _ :: hdr_len :: rest =>
+              let udp_data := drop ((N.to_nat hdr_len + 1) * 8 - 2) rest in
+              match parse_header udp_data with
+              | None => inl Header_Too_Short
+              | Some (h, payload) =>
+                  if N.eqb h.(length16) 0
+                  then
+                    (* Jumbogram - verify length *)
+                    if N.eqb jumbo_len (8 + lenN payload)
+                    then
+                      (* Verify checksum with jumbo pseudo-header *)
+                      let pseudo := ipv6_words src ++ ipv6_words dst ++
+                                   [to_word16 (jumbo_len / 65536); 
+                                    to_word16 (jumbo_len mod 65536)] ++
+                                   [0; 17] in
+                      let computed := cksum16 (pseudo ++ words16_of_bytes_be udp_data) in
+                      if N.eqb computed 0
+                      then inr (h.(src_port), h.(dst_port), payload)
+                      else inl Bad_Checksum
+                    else inl Length_Mismatch
+                  else inl Invalid_Jumbo_Header
+              end
+          | _ => inl Invalid_Extension_Header
+          end
+      end
+    else if N.eqb next_header 17 then
+      (* Direct UDP, no jumbogram - just parse the header and verify normally *)
+      match parse_header data with
+      | None => inl Header_Too_Short
+      | Some (h, payload) =>
+          (* Verify standard UDP *)
+          let pseudo := pseudo_header_v6 src dst (8 + lenN payload) in
+          let computed := cksum16 (pseudo ++ words16_of_bytes_be data) in
+          if N.eqb computed 0
+          then inr (h.(src_port), h.(dst_port), payload)
+          else inl Bad_Checksum
+      end
+    else
+      inl Invalid_Next_Header.
+
+(* Send with automatic jumbo selection and path probing *)
+  Definition send_udp_ipv6_auto_jumbo (stack : NetworkStackJumbo) 
+                                      (src dst : IPv6) 
+                                      (src_port dst_port : word16)
+                                      (payload : list byte)
+                                      (current_time : N)
+    : (JumboError + list byte) * NetworkStackJumbo :=
+    let packet_size := 8 + lenN payload in
+    if N.leb packet_size MAX_NORMAL_PAYLOAD
+    then 
+      (* Normal size, no jumbo needed - build directly *)
+      let udp_header := {| src_port := src_port;
+                          dst_port := dst_port;
+                          length16 := to_word16 packet_size;
+                          checksum := 0 |} in
+      let checksum := compute_udp_checksum_ipv6 src dst udp_header payload in
+      let final_header := {| src_port := src_port;
+                            dst_port := dst_port;
+                            length16 := to_word16 packet_size;
+                            checksum := checksum |} in
+      (inr (udp_header_bytes final_header ++ payload), stack)
+    else
+      (* Check if path supports jumbo *)
+      let (max_jumbo, stack') := probe_jumbo_support stack dst current_time in
+      if N.leb packet_size max_jumbo
+      then
+        (* Path supports this jumbo size *)
+        let result := encode_udp_ipv6_jumbo src dst src_port dst_port payload in
+        let stack'' := update_jumbo_cache stack' dst packet_size true current_time in
+        (result, stack'')
+      else
+        (* Path doesn't support, need fragmentation or error *)
+        let stack'' := update_jumbo_cache stack' dst max_jumbo false current_time in
+        (inl Packet_Too_Large, stack'').
+
+End UDP_Jumbogram.
+
+(* Final Complete Extraction with all 37 sections *)
 Require Extraction.
 Require Import ExtrOcamlBasic.
 Require Import ExtrOcamlNatInt.
@@ -6941,8 +7371,8 @@ Extract Inductive nat => "int"
   [ "0" "(fun n -> n + 1)" ]
   "(fun f0 fs n -> if n = 0 then f0 () else fs (n - 1))".
 
-(* Complete UDP Stack Extraction *)
-Extraction "udp_complete.ml"
+(* Complete UDP Stack Extraction with all 37 sections *)
+Extraction "udp_final.ml"
   (* Core Protocol *)
   encode_udp_ipv4
   decode_udp_ipv4
@@ -7004,12 +7434,38 @@ Extraction "udp_complete.ml"
   validate_pmtu
   send_with_pmtu
   age_pmtu_entries
+  default_pmtu_config
+  
+  (* ICMP Generation *)
+  generate_icmp_port_unreachable
+  build_icmp_ip_packet
+  process_udp_rx_with_icmp
+  send_icmp_response
+  receive_udp_with_icmp
+  should_send_icmp_rl
+  ICMP_TYPE_DEST_UNREACHABLE
+  ICMP_CODE_PORT_UNREACHABLE
+  
+  (* Jumbograms - NEW *)
+  encode_udp_ipv6_jumbo
+  decode_udp_ipv6_jumbo
+  parse_hop_by_hop
+  build_jumbo_hop_by_hop
+  probe_jumbo_support
+  update_jumbo_cache
+  send_udp_ipv6_auto_jumbo
+  ipv6_eq
+  IPV6_HOP_BY_HOP
+  IPV6_OPTION_JUMBO
+  MAX_NORMAL_PAYLOAD
+  MAX_JUMBO_PAYLOAD
+  JumboError
+  NetworkStackJumbo
   
   (* Configuration *)
   defaults_ipv4
   defaults_ipv6
   ipv4_hardened_default
-  default_pmtu_config
   
   (* Tests *)
   run_all_tests.
@@ -7025,12 +7481,9 @@ Extraction "udp_complete.ml"
     ### 2. Extended Protocols
     - UDP-Lite (RFC 3828) with partial checksums
     - DTLS integration for secure UDP
-    - Path MTU discovery integration
-    - Jumbogram support for IPv6 payloads > 65535 bytes
     
     ### 3. Formal Network Stack
     - Integration with verified IP layer
     - Composition with verified Ethernet
     - Full verified socket API
-    - ICMPv6 error handling
     **************************************************************************** *)
