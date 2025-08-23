@@ -10,21 +10,6 @@
    
    "And so at the gates of Eregion, the Gift-lord stood."
    
-   =============================================================================
-   
-   This formalization provides a machine-verified implementation of the UDP
-   protocol with the following components:
-   
-   - Wire format encoding/decoding (§2-3 RFC 768)
-   - Internet checksum computation (§4 RFC 1071)
-   - Pseudo-header construction for IPv4/IPv6 (§8.1 RFC 8200)
-   - Length field validation (0-65535 octets)
-   - Port number handling (including source port 0 semantics)
-   
-   Verification targets:
-   - Encode/decode bijection for well-formed datagrams
-   - Checksum algorithm correctness
-   - Protocol conformance to RFC specifications
    ============================================================================= *)
 
 (* ===== Dependencies ===== *)
@@ -5834,16 +5819,626 @@ Section UDP_Network_Interface.
 
 End UDP_Network_Interface.
 
+Section UDP_MTU_Handling.
+  Open Scope N_scope.
+
+Fixpoint fragment_list_aux (data : list byte) (max_size : nat) (fuel : nat) : list (list byte) :=
+  match fuel with
+  | O => [data]  (* Out of fuel, return remaining data as final chunk *)
+  | S fuel' =>
+      match data with
+      | [] => []
+      | _ =>
+          let chunk := take max_size data in
+          let rest := drop max_size data in
+          match rest with
+          | [] => [chunk]
+          | _ => chunk :: fragment_list_aux rest max_size fuel'
+          end
+      end
+  end.
+
+Definition fragment_list (data : list byte) (max_size : nat) : list (list byte) :=
+  fragment_list_aux data max_size (length data).
+
+  (* Fragment outgoing packet if it exceeds MTU *)
+  Definition fragment_packet (packet : list byte) (mtu : N) : list (list byte) :=
+    if lenN packet <=? mtu then [packet]
+    else
+      let ip_header_size := 20 in
+      let max_fragment_size := ((mtu - ip_header_size) / 8) * 8 in
+      fragment_list packet (N.to_nat max_fragment_size).
+
+  (* Find socket helper *)
+  Fixpoint find_socket_by_fd (socks : socket_table) (sock_fd : socket_fd) : option UDPSocket :=
+    match socks with
+    | [] => None
+    | s::rest => if N.eqb s.(fd) sock_fd then Some s else find_socket_by_fd rest sock_fd
+    end.
+
+  (* Enhanced send that fragments if needed *)
+  Definition send_udp_with_fragmentation (stack : NetworkStack) (sock_fd : socket_fd)
+                                         (dst_addr : IPv4) (dst_port : word16) (data : list byte)
+    : NetworkStack :=
+    match find_socket_by_fd stack.(sockets) sock_fd with
+    | None => stack
+    | Some sock =>
+        match find_route stack dst_addr with
+        | Some (iface, next_hop) =>
+            match sendto sock dst_addr dst_port data with
+            | inl (_, wire) =>
+                let fragments := fragment_packet wire iface.(if_mtu) in
+                fold_left (fun s frag => send_packet s iface.(if_index) frag) 
+                          fragments stack
+            | inr _ => stack
+            end
+        | None => stack
+        end
+    end.
+
+End UDP_MTU_Handling.
+
+Section UDP_Multicast.
+  Open Scope N_scope.
+
+  (* Multicast group membership *)
+  Record MulticastGroup := {
+    mg_addr : IPv4;
+    mg_interface : N;
+    mg_refcount : N;
+    mg_timer : N;
+    mg_reporter : bool
+  }.
+
+  (* IGMP message types *)
+  Definition IGMP_MEMBERSHIP_QUERY : byte := 17.
+  Definition IGMP_V1_MEMBERSHIP_REPORT : byte := 18.
+  Definition IGMP_V2_MEMBERSHIP_REPORT : byte := 22.
+  Definition IGMP_V2_LEAVE_GROUP : byte := 23.
+
+  (* IGMP header *)
+  Record IGMPHeader := {
+    igmp_type : byte;
+    igmp_max_resp : byte;
+    igmp_checksum : word16;
+    igmp_group : IPv4
+  }.
+
+  (* Build IP header for IGMP *)
+  Definition build_ip_header_igmp (src dst : IPv4) (payload_len : N) : list byte :=
+    let version_ihl := 69 in  (* Version 4, IHL 6 for 24 bytes *)
+    let tos := 0 in
+    let total_len := 24 + payload_len in  (* 24 byte IP header with Router Alert plus IGMP payload *)
+    let ident := 0 in
+    let flags_frag := 0 in  (* No fragmentation *)
+    let ttl := 1 in  (* IGMP uses TTL=1 *)
+    let protocol := 2 in  (* IGMP protocol number *)
+    let checksum := 0 in  (* Compute separately *)
+    [version_ihl; tos]
+    ++ bytes_of_words16_be [to_word16 total_len]
+    ++ bytes_of_words16_be [to_word16 ident]
+    ++ bytes_of_words16_be [to_word16 flags_frag]
+    ++ [ttl; protocol]
+    ++ bytes_of_words16_be [to_word16 checksum]
+    ++ [src.(a0); src.(a1); src.(a2); src.(a3)]
+    ++ [dst.(a0); dst.(a1); dst.(a2); dst.(a3)]
+    ++ [148; 4; 0; 0].  (* Router Alert option: type=148, len=4, value=0 *)
+
+  (* Compute IGMP checksum *)
+  Definition compute_igmp_checksum (msg : list byte) : word16 :=
+    cksum16 (words16_of_bytes_be msg).
+
+  (* Build complete IGMP report packet *)
+  Definition build_igmp_report_packet (src : IPv4) (group : IPv4) : list byte :=
+    let igmp_body := [IGMP_V2_MEMBERSHIP_REPORT; 0]
+                     ++ [0; 0]  (* Checksum placeholder *)
+                     ++ [group.(a0); group.(a1); group.(a2); group.(a3)] in
+    let igmp_checksum := compute_igmp_checksum igmp_body in
+    let igmp_complete := [IGMP_V2_MEMBERSHIP_REPORT; 0]
+                         ++ bytes_of_words16_be [igmp_checksum]
+                         ++ [group.(a0); group.(a1); group.(a2); group.(a3)] in
+    let ip_hdr := build_ip_header_igmp src group 8 in
+    let ip_checksum := cksum16 (words16_of_bytes_be (take 20 ip_hdr)) in
+    let ip_hdr_complete := take 10 ip_hdr
+                          ++ bytes_of_words16_be [ip_checksum]
+                          ++ drop 12 ip_hdr in
+    ip_hdr_complete ++ igmp_complete.
+
+  (* Build complete IGMP leave packet *)
+  Definition build_igmp_leave_packet (src : IPv4) (group : IPv4) : list byte :=
+    let all_routers := mkIPv4 224 0 0 2 in  (* Leave messages go to all-routers group *)
+    let igmp_body := [IGMP_V2_LEAVE_GROUP; 0]
+                     ++ [0; 0]  (* Checksum placeholder *)
+                     ++ [group.(a0); group.(a1); group.(a2); group.(a3)] in
+    let igmp_checksum := compute_igmp_checksum igmp_body in
+    let igmp_complete := [IGMP_V2_LEAVE_GROUP; 0]
+                         ++ bytes_of_words16_be [igmp_checksum]
+                         ++ [group.(a0); group.(a1); group.(a2); group.(a3)] in
+    let ip_hdr := build_ip_header_igmp src all_routers 8 in
+    let ip_checksum := cksum16 (words16_of_bytes_be (take 20 ip_hdr)) in
+    let ip_hdr_complete := take 10 ip_hdr
+                          ++ bytes_of_words16_be [ip_checksum]
+                          ++ drop 12 ip_hdr in
+    ip_hdr_complete ++ igmp_complete.
+
+  (* Extended socket with multicast groups *)
+  Record UDPSocketMcast := {
+    sock_base : UDPSocket;
+    sock_groups : list IPv4
+  }.
+
+  (* Extended network stack with multicast state *)
+  Record NetworkStackMcast := {
+    stack_base : NetworkStack;
+    mcast_groups : list MulticastGroup
+  }.
+
+  (* Check if address is IPv4 multicast (224.0.0.0/4) *)
+  Definition is_ipv4_multicast (ip : IPv4) : bool :=
+    andb (224 <=? ip.(a0)) (ip.(a0) <=? 239).
+
+  (* Get interface address for IGMP source *)
+  Definition get_interface_addr (stack : NetworkStack) (if_idx : N) : IPv4 :=
+    let fix find_if (ifs : list NetInterface) : IPv4 :=
+      match ifs with
+      | [] => mkIPv4 0 0 0 0
+      | iface::rest =>
+          if N.eqb iface.(if_index) if_idx
+          then iface.(if_addr)
+          else find_if rest
+      end in
+    find_if stack.(interfaces).
+
+  (* Join multicast group *)
+  Definition join_mcast_group (stack : NetworkStackMcast) (sock_fd : socket_fd) 
+                              (group : IPv4) (if_idx : N) : NetworkStackMcast :=
+    if is_ipv4_multicast group then
+      let fix update_groups (groups : list MulticastGroup) (found : bool) 
+        : list MulticastGroup * bool :=
+        match groups with
+        | [] => 
+            if found then ([], true)
+            else ([{| mg_addr := group;
+                     mg_interface := if_idx;
+                     mg_refcount := 1;
+                     mg_timer := 0;
+                     mg_reporter := true |}], false)
+        | g::rest =>
+            if andb (ipv4_eq g.(mg_addr) group) (N.eqb g.(mg_interface) if_idx) then
+              ({| mg_addr := g.(mg_addr);
+                  mg_interface := g.(mg_interface);
+                  mg_refcount := g.(mg_refcount) + 1;
+                  mg_timer := g.(mg_timer);
+                  mg_reporter := g.(mg_reporter) |} :: rest, true)
+            else
+              let (rest', found') := update_groups rest found in
+              (g :: rest', found')
+        end in
+      let (new_groups, was_joined) := update_groups stack.(mcast_groups) false in
+      let new_base := 
+        if was_joined then stack.(stack_base)
+        else 
+          let src := get_interface_addr stack.(stack_base) if_idx in
+          let packet := build_igmp_report_packet src group in
+          send_packet stack.(stack_base) if_idx packet in
+      {| stack_base := new_base;
+         mcast_groups := new_groups |}
+    else
+      stack.
+
+  (* Leave multicast group *)
+  Definition leave_mcast_group (stack : NetworkStackMcast) (sock_fd : socket_fd)
+                               (group : IPv4) (if_idx : N) : NetworkStackMcast :=
+    let fix update_groups (groups : list MulticastGroup) 
+      : list MulticastGroup * bool :=
+      match groups with
+      | [] => ([], false)
+      | g::rest =>
+          if andb (ipv4_eq g.(mg_addr) group) (N.eqb g.(mg_interface) if_idx) then
+            if N.eqb g.(mg_refcount) 1 then
+              (rest, true)  (* Last reference, need to send leave *)
+            else
+              ({| mg_addr := g.(mg_addr);
+                  mg_interface := g.(mg_interface);
+                  mg_refcount := g.(mg_refcount) - 1;
+                  mg_timer := g.(mg_timer);
+                  mg_reporter := g.(mg_reporter) |} :: rest, false)
+          else
+            let (rest', should_leave) := update_groups rest in
+            (g :: rest', should_leave)
+      end in
+    let (new_groups, should_send_leave) := update_groups stack.(mcast_groups) in
+    let new_base :=
+      if should_send_leave then
+        let src := get_interface_addr stack.(stack_base) if_idx in
+        let packet := build_igmp_leave_packet src group in
+        send_packet stack.(stack_base) if_idx packet
+      else stack.(stack_base) in
+    {| stack_base := new_base;
+       mcast_groups := new_groups |}.
+
+  (* Process incoming IGMP query *)
+  Definition process_igmp_query (stack : NetworkStackMcast) (src : IPv4) 
+                                (query_group : IPv4) (max_resp : byte) : NetworkStackMcast :=
+    let fix update_timers (groups : list MulticastGroup) : list MulticastGroup :=
+      match groups with
+      | [] => []
+      | g::rest =>
+          if orb (ipv4_eq query_group (mkIPv4 0 0 0 0))
+                 (ipv4_eq query_group g.(mg_addr)) then
+            {| mg_addr := g.(mg_addr);
+               mg_interface := g.(mg_interface);
+               mg_refcount := g.(mg_refcount);
+               mg_timer := N.modulo (g.(mg_interface) + N.of_nat (length groups)) 
+                                    (N.of_nat (N.to_nat max_resp));
+               mg_reporter := true |} :: update_timers rest
+          else
+            g :: update_timers rest
+      end in
+    {| stack_base := stack.(stack_base);
+       mcast_groups := update_timers stack.(mcast_groups) |}.
+
+End UDP_Multicast.
+
+Section UDP_IPv6_Multicast.
+  Open Scope N_scope.
+
+  (* MLD message types for ICMPv6 *)
+  Definition MLD_LISTENER_QUERY : byte := 130.
+  Definition MLD_LISTENER_REPORT : byte := 131.
+  Definition MLD_LISTENER_DONE : byte := 132.
+  Definition MLDv2_LISTENER_REPORT : byte := 143.
+
+  (* IPv6 multicast group *)
+  Record MulticastGroupV6 := {
+    mg6_addr : IPv6;
+    mg6_interface : N;
+    mg6_refcount : N;
+    mg6_timer : N;
+    mg6_version : N  (* MLDv1 = 1, MLDv2 = 2 *)
+  }.
+
+  (* Check if IPv6 address is multicast FF00::/8 *)
+  Definition is_ipv6_multicast (ip : IPv6) : bool :=
+    255 =? (ip.(v6_0) / 256).
+
+  (* Build ICMPv6 header for MLD *)
+  Definition build_mld_report (group : IPv6) : list byte :=
+    let icmp_type := MLD_LISTENER_REPORT in
+    let icmp_code := 0 in
+    let checksum := 0 in  (* Compute with pseudo-header *)
+    let max_delay := 0 in
+    let reserved := 0 in
+    [icmp_type; icmp_code]
+    ++ bytes_of_words16_be [checksum]
+    ++ bytes_of_words16_be [to_word16 max_delay]
+    ++ bytes_of_words16_be [to_word16 reserved]
+    ++ bytes_of_words16_be [group.(v6_0); group.(v6_1); group.(v6_2); group.(v6_3);
+                            group.(v6_4); group.(v6_5); group.(v6_6); group.(v6_7)].
+
+  (* Build complete IPv6 packet with MLD *)
+  Definition build_mld_packet (src : IPv6) (dst : IPv6) (mld_payload : list byte) : list byte :=
+    let version_class_flow := [96; 0; 0; 0] in  (* Version 6, class 0, flow 0 *)
+    let payload_len := lenN mld_payload in
+    let next_header := 58 in  (* ICMPv6 *)
+    let hop_limit := 1 in  (* MLD uses hop limit 1 *)
+    version_class_flow
+    ++ bytes_of_words16_be [to_word16 payload_len]
+    ++ [next_header; hop_limit]
+    ++ bytes_of_words16_be (ipv6_words src)
+    ++ bytes_of_words16_be (ipv6_words dst)
+    ++ mld_payload.
+
+  (* Compute ICMPv6 checksum with pseudo-header *)
+  Definition compute_icmpv6_checksum (src dst : IPv6) (icmp_data : list byte) : word16 :=
+    let pseudo := ipv6_words src ++ ipv6_words dst ++
+                  [0; to_word16 (lenN icmp_data)] ++
+                  [0; 58] in  (* Next header = ICMPv6 *)
+    cksum16 (pseudo ++ words16_of_bytes_be icmp_data).
+
+  (* Join IPv6 multicast group *)
+  Definition join_mcast_group_v6 (groups : list MulticastGroupV6) (group : IPv6) (if_idx : N)
+    : list MulticastGroupV6 * bool :=
+    let fix update (gs : list MulticastGroupV6) : list MulticastGroupV6 * bool :=
+      match gs with
+      | [] => 
+          ([{| mg6_addr := group;
+               mg6_interface := if_idx;
+               mg6_refcount := 1;
+               mg6_timer := 0;
+               mg6_version := 2 |}], true)  (* New group, need to send report *)
+      | g::rest =>
+          if andb (N.eqb (lenN (ipv6_words g.(mg6_addr))) (lenN (ipv6_words group)))
+                  (N.eqb g.(mg6_interface) if_idx) then
+            ({| mg6_addr := g.(mg6_addr);
+                mg6_interface := g.(mg6_interface);
+                mg6_refcount := g.(mg6_refcount) + 1;
+                mg6_timer := g.(mg6_timer);
+                mg6_version := g.(mg6_version) |} :: rest, false)  (* Already joined *)
+          else
+            let (rest', send) := update rest in
+            (g :: rest', send)
+      end in
+    update groups.
+
+  (* Send MLD report *)
+  Definition send_mld_report (src : IPv6) (group : IPv6) : list byte :=
+    let mld_msg := build_mld_report group in
+    let checksum := compute_icmpv6_checksum src group mld_msg in
+    let mld_with_checksum := 
+      take 2 mld_msg 
+      ++ bytes_of_words16_be [checksum]
+      ++ drop 4 mld_msg in
+    build_mld_packet src group mld_with_checksum.
+
+End UDP_IPv6_Multicast.
+
+Section UDP_NAT.
+  Open Scope N_scope.
+
+  (* NAT mapping entry *)
+  Record NATMapping := {
+    nat_internal_ip : IPv4;
+    nat_internal_port : word16;
+    nat_external_ip : IPv4;
+    nat_external_port : word16;
+    nat_remote_ip : IPv4;        (* Remote endpoint *)
+    nat_remote_port : word16;
+    nat_last_activity : N;        (* Timestamp of last packet *)
+    nat_type : N                  (* 0=Full Cone, 1=Restricted, 2=Port Restricted, 3=Symmetric *)
+  }.
+
+  (* Connection tracking state *)
+  Record ConnTrack := {
+    ct_src_ip : IPv4;
+    ct_src_port : word16;
+    ct_dst_ip : IPv4;
+    ct_dst_port : word16;
+    ct_state : N;                 (* 0=NEW, 1=ESTABLISHED, 2=RELATED *)
+    ct_packets_out : N;
+    ct_packets_in : N;
+    ct_last_seen : N
+  }.
+
+  (* NAT configuration *)
+  Record NATConfig := {
+    nat_external_addr : IPv4;     (* Public IP address *)
+    nat_port_range_min : word16;  (* Min ephemeral port *)
+    nat_port_range_max : word16;  (* Max ephemeral port *)
+    nat_timeout : N;              (* Mapping timeout in seconds *)
+    nat_type_policy : N           (* NAT type: Full Cone, Restricted, etc *)
+  }.
+
+  (* Extended network stack with NAT *)
+  Record NetworkStackNAT := {
+    nat_base : NetworkStack;
+    nat_mappings : list NATMapping;
+    nat_connections : list ConnTrack;
+    nat_config : NATConfig;
+    nat_next_port : word16;       (* Next available external port *)
+    nat_time : N                  (* Current time counter *)
+  }.
+
+  (* Find existing NAT mapping *)
+  Definition find_nat_mapping (mappings : list NATMapping) 
+                              (int_ip : IPv4) (int_port : word16)
+                              (rem_ip : IPv4) (rem_port : word16)
+                              (nat_type : N) : option NATMapping :=
+    let fix find (ms : list NATMapping) : option NATMapping :=
+      match ms with
+      | [] => None
+      | m::rest =>
+          match nat_type with
+          | 0 => (* Full Cone - match only internal endpoint *)
+              if andb (ipv4_eq m.(nat_internal_ip) int_ip)
+                      (N.eqb m.(nat_internal_port) int_port)
+              then Some m else find rest
+          | 1 => (* Restricted Cone - match internal + remote IP *)
+              if andb (andb (ipv4_eq m.(nat_internal_ip) int_ip)
+                           (N.eqb m.(nat_internal_port) int_port))
+                     (ipv4_eq m.(nat_remote_ip) rem_ip)
+              then Some m else find rest
+          | 2 => (* Port Restricted - match internal + remote IP:port *)
+              if andb (andb (ipv4_eq m.(nat_internal_ip) int_ip)
+                           (N.eqb m.(nat_internal_port) int_port))
+                     (andb (ipv4_eq m.(nat_remote_ip) rem_ip)
+                          (N.eqb m.(nat_remote_port) rem_port))
+              then Some m else find rest
+          | _ => (* Symmetric - different mapping per destination *)
+              if andb (andb (ipv4_eq m.(nat_internal_ip) int_ip)
+                           (N.eqb m.(nat_internal_port) int_port))
+                     (andb (ipv4_eq m.(nat_remote_ip) rem_ip)
+                          (N.eqb m.(nat_remote_port) rem_port))
+              then Some m else find rest
+          end
+      end in
+    find mappings.
+
+  (* Allocate new external port *)
+  Definition allocate_external_port (stack : NetworkStackNAT) : word16 * NetworkStackNAT :=
+    let port := stack.(nat_next_port) in
+    let next := if port <? stack.(nat_config).(nat_port_range_max)
+                then port + 1
+                else stack.(nat_config).(nat_port_range_min) in
+    (port, {| nat_base := stack.(nat_base);
+              nat_mappings := stack.(nat_mappings);
+              nat_connections := stack.(nat_connections);
+              nat_config := stack.(nat_config);
+              nat_next_port := next;
+              nat_time := stack.(nat_time) |}).
+
+  (* Create new NAT mapping *)
+  Definition create_nat_mapping (stack : NetworkStackNAT)
+                                (int_ip : IPv4) (int_port : word16)
+                                (rem_ip : IPv4) (rem_port : word16)
+    : NATMapping * NetworkStackNAT :=
+    let (ext_port, stack') := allocate_external_port stack in
+    let mapping := {| nat_internal_ip := int_ip;
+                      nat_internal_port := int_port;
+                      nat_external_ip := stack.(nat_config).(nat_external_addr);
+                      nat_external_port := ext_port;
+                      nat_remote_ip := rem_ip;
+                      nat_remote_port := rem_port;
+                      nat_last_activity := stack'.(nat_time);
+                      nat_type := stack.(nat_config).(nat_type_policy) |} in
+    (mapping, {| nat_base := stack'.(nat_base);
+                 nat_mappings := mapping :: stack'.(nat_mappings);
+                 nat_connections := stack'.(nat_connections);
+                 nat_config := stack'.(nat_config);
+                 nat_next_port := stack'.(nat_next_port);
+                 nat_time := stack'.(nat_time) |}).
+
+  (* Translate outbound packet *)
+  Definition nat_outbound (stack : NetworkStackNAT)
+                         (src_ip dst_ip : IPv4) 
+                         (udp_packet : list byte)
+    : option (IPv4 * list byte * NetworkStackNAT) :=
+    match parse_header udp_packet with
+    | None => None
+    | Some (h, data) =>
+        match find_nat_mapping stack.(nat_mappings) 
+                               src_ip h.(src_port)
+                               dst_ip h.(dst_port)
+                               stack.(nat_config).(nat_type_policy) with
+        | Some mapping =>
+            (* Use existing mapping *)
+            let new_header := {| src_port := mapping.(nat_external_port);
+                                dst_port := h.(dst_port);
+                                length16 := h.(length16);
+                                checksum := 0 |} in
+            (* Recompute checksum *)
+            let new_checksum := compute_udp_checksum_ipv4 
+                                 mapping.(nat_external_ip) dst_ip new_header data in
+            let final_header := {| src_port := new_header.(src_port);
+                                  dst_port := new_header.(dst_port);
+                                  length16 := new_header.(length16);
+                                  checksum := new_checksum |} in
+            Some (mapping.(nat_external_ip),
+                  udp_header_bytes final_header ++ data,
+                  stack)
+        | None =>
+            (* Create new mapping *)
+            let (mapping, stack') := create_nat_mapping stack 
+                                                        src_ip h.(src_port)
+                                                        dst_ip h.(dst_port) in
+            let new_header := {| src_port := mapping.(nat_external_port);
+                                dst_port := h.(dst_port);
+                                length16 := h.(length16);
+                                checksum := 0 |} in
+            let new_checksum := compute_udp_checksum_ipv4
+                                 mapping.(nat_external_ip) dst_ip new_header data in
+            let final_header := {| src_port := new_header.(src_port);
+                                  dst_port := new_header.(dst_port);
+                                  length16 := new_header.(length16);
+                                  checksum := new_checksum |} in
+            Some (mapping.(nat_external_ip),
+                  udp_header_bytes final_header ++ data,
+                  stack')
+        end
+    end.
+
+  (* Find reverse mapping for inbound packet *)
+  Definition find_reverse_mapping (mappings : list NATMapping)
+                                  (ext_ip : IPv4) (ext_port : word16)
+                                  (rem_ip : IPv4) (rem_port : word16)
+    : option NATMapping :=
+    let fix find (ms : list NATMapping) : option NATMapping :=
+      match ms with
+      | [] => None
+      | m::rest =>
+          if andb (ipv4_eq m.(nat_external_ip) ext_ip)
+                  (N.eqb m.(nat_external_port) ext_port)
+          then Some m
+          else find rest
+      end in
+    find mappings.
+
+  (* Translate inbound packet *)
+  Definition nat_inbound (stack : NetworkStackNAT)
+                        (src_ip dst_ip : IPv4)
+                        (udp_packet : list byte)
+    : option (IPv4 * list byte) :=
+    match parse_header udp_packet with
+    | None => None
+    | Some (h, data) =>
+        match find_reverse_mapping stack.(nat_mappings)
+                                   dst_ip h.(dst_port)
+                                   src_ip h.(src_port) with
+        | None => None  (* No mapping, drop packet *)
+        | Some mapping =>
+            (* Check NAT type restrictions *)
+            match mapping.(nat_type) with
+            | 0 => (* Full Cone - allow from any source *)
+                let new_header := {| src_port := h.(src_port);
+                                    dst_port := mapping.(nat_internal_port);
+                                    length16 := h.(length16);
+                                    checksum := 0 |} in
+                let new_checksum := compute_udp_checksum_ipv4
+                                     src_ip mapping.(nat_internal_ip) new_header data in
+                let final_header := {| src_port := new_header.(src_port);
+                                      dst_port := new_header.(dst_port);
+                                      length16 := new_header.(length16);
+                                      checksum := new_checksum |} in
+                Some (mapping.(nat_internal_ip),
+                      udp_header_bytes final_header ++ data)
+            | 1 => (* Restricted Cone - check source IP *)
+                if ipv4_eq src_ip mapping.(nat_remote_ip) then
+                  let new_header := {| src_port := h.(src_port);
+                                      dst_port := mapping.(nat_internal_port);
+                                      length16 := h.(length16);
+                                      checksum := 0 |} in
+                  let new_checksum := compute_udp_checksum_ipv4
+                                       src_ip mapping.(nat_internal_ip) new_header data in
+                  let final_header := {| src_port := new_header.(src_port);
+                                        dst_port := new_header.(dst_port);
+                                        length16 := new_header.(length16);
+                                        checksum := new_checksum |} in
+                  Some (mapping.(nat_internal_ip),
+                        udp_header_bytes final_header ++ data)
+                else None
+            | _ => (* Port Restricted or Symmetric - check source IP:port *)
+                if andb (ipv4_eq src_ip mapping.(nat_remote_ip))
+                       (N.eqb h.(src_port) mapping.(nat_remote_port)) then
+                  let new_header := {| src_port := h.(src_port);
+                                      dst_port := mapping.(nat_internal_port);
+                                      length16 := h.(length16);
+                                      checksum := 0 |} in
+                  let new_checksum := compute_udp_checksum_ipv4
+                                       src_ip mapping.(nat_internal_ip) new_header data in
+                  let final_header := {| src_port := new_header.(src_port);
+                                        dst_port := new_header.(dst_port);
+                                        length16 := new_header.(length16);
+                                        checksum := new_checksum |} in
+                  Some (mapping.(nat_internal_ip),
+                        udp_header_bytes final_header ++ data)
+                else None
+            end
+        end
+    end.
+
+  (* Clean up expired mappings *)
+  Definition cleanup_nat_mappings (stack : NetworkStackNAT) : NetworkStackNAT :=
+    let timeout := stack.(nat_config).(nat_timeout) in
+    let current_time := stack.(nat_time) in
+    let fix filter_active (ms : list NATMapping) : list NATMapping :=
+      match ms with
+      | [] => []
+      | m::rest =>
+          if (current_time - m.(nat_last_activity)) <? timeout
+          then m :: filter_active rest
+          else filter_active rest
+      end in
+    {| nat_base := stack.(nat_base);
+       nat_mappings := filter_active stack.(nat_mappings);
+       nat_connections := stack.(nat_connections);
+       nat_config := stack.(nat_config);
+       nat_next_port := stack.(nat_next_port);
+       nat_time := stack.(nat_time) |}.
+
+End UDP_NAT.
+
 (** ****************************************************************************
-    
-    RFC 768 UDP/IPv4/IPv6 Formal Verification in Coq
-    =================================================
-    
-    This formalization provides a comprehensive, machine-checked 
-    verification of the User Datagram Protocol (UDP) as specified in RFC 768,
-    with full IPv6 support (RFC 8200) and extensions from RFC 1122/1812 for 
-    ICMP error handling.
-    
+
     ## Future Work
     
     ### 1. Extraction and Testing
@@ -5862,17 +6457,5 @@ End UDP_Network_Interface.
     - Composition with verified Ethernet
     - Full verified socket API
     - ICMPv6 error handling
-    
-    ## Usage
-    
-    The implementation provides both encoding and decoding functions that can
-    be extracted to OCaml for use in real systems:
-    
-    - encode_udp_ipv4: Produces RFC-compliant UDP/IPv4 datagrams
-    - decode_udp_ipv4: Parses and validates incoming IPv4 datagrams
-    - encode_udp_ipv6: Produces RFC-compliant UDP/IPv6 datagrams  
-    - decode_udp_ipv6: Parses and validates incoming IPv6 datagrams
-    - Configurable policies via the Config record
-    
     **************************************************************************** *)
 
