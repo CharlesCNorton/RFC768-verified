@@ -6437,12 +6437,588 @@ Section UDP_NAT.
 
 End UDP_NAT.
 
+Section UDP_RateLimit.
+  Open Scope N_scope.
+
+  (* Token bucket for rate limiting *)
+  Record TokenBucket := {
+    tb_capacity : N;
+    tb_tokens : N;
+    tb_rate : N;
+    tb_last_refill : N
+  }.
+
+  (* Per-flow rate limiter *)
+  Record FlowRateLimit := {
+    flow_src : IPv4;
+    flow_dst : IPv4;
+    flow_sport : word16;
+    flow_dport : word16;
+    flow_bucket : TokenBucket;
+    flow_drops : N
+  }.
+
+  (* Leaky bucket for smoothing *)
+  Record LeakyBucket := {
+    lb_rate : N;
+    lb_buffer : list (N * list byte);
+    lb_buffer_size : N;
+    lb_max_buffer : N;
+    lb_last_drain : N
+  }.
+
+  (* Extended stack with rate limiting *)
+  Record NetworkStackRL := {
+    rl_base : NetworkStack;
+    rl_global_bucket : TokenBucket;
+    rl_flow_limits : list FlowRateLimit;
+    rl_leaky : LeakyBucket;
+    rl_time : N
+  }.
+
+  (* ECN codepoints in IP TOS/DSCP field *)
+  Definition ECN_NOT_ECT : N := 0.  (* Not ECN-Capable Transport *)
+  Definition ECN_ECT0 : N := 2.     (* ECN-Capable Transport(0) *)
+  Definition ECN_ECT1 : N := 1.     (* ECN-Capable Transport(1) *)
+  Definition ECN_CE : N := 3.       (* Congestion Experienced *)
+
+  (* Set ECN bits in IP packet *)
+  Definition set_ecn_in_ip_packet (packet : list byte) (ecn : N) : list byte :=
+    match packet with
+    | v_ihl :: tos :: rest =>
+        (* ECN is in bits 6-7 of TOS byte *)
+        let dscp := N.land (tos / 4) 63 in  (* Keep DSCP bits 0-5 *)
+        let new_tos := (dscp * 4) + (N.land ecn 3) in
+        v_ihl :: new_tos :: rest
+    | _ => packet  (* Malformed packet *)
+    end.
+
+  (* Get ECN bits from IP packet *)
+  Definition get_ecn_from_ip_packet (packet : list byte) : N :=
+    match packet with
+    | _ :: tos :: _ => N.land tos 3
+    | _ => 0
+    end.
+
+  (* Refill token bucket based on elapsed time *)
+  Definition refill_bucket (bucket : TokenBucket) (now : N) : TokenBucket :=
+    let elapsed := now - bucket.(tb_last_refill) in
+    let new_tokens := bucket.(tb_tokens) + (elapsed * bucket.(tb_rate)) in
+    let capped_tokens := if N.ltb bucket.(tb_capacity) new_tokens
+                         then bucket.(tb_capacity)
+                         else new_tokens in
+    {| tb_capacity := bucket.(tb_capacity);
+       tb_tokens := capped_tokens;
+       tb_rate := bucket.(tb_rate);
+       tb_last_refill := now |}.
+
+  (* Consume tokens if available *)
+  Definition consume_tokens (bucket : TokenBucket) (amount : N) : option TokenBucket :=
+    if N.leb amount bucket.(tb_tokens)
+    then Some {| tb_capacity := bucket.(tb_capacity);
+                 tb_tokens := bucket.(tb_tokens) - amount;
+                 tb_rate := bucket.(tb_rate);
+                 tb_last_refill := bucket.(tb_last_refill) |}
+    else None.
+
+  (* Check rate limit for packet *)
+  Definition check_rate_limit (stack : NetworkStackRL)
+                             (src dst : IPv4) (sport dport : word16)
+                             (packet_size : N)
+    : bool * NetworkStackRL :=
+    let global' := refill_bucket stack.(rl_global_bucket) stack.(rl_time) in
+    match consume_tokens global' packet_size with
+    | None => (false, stack)
+    | Some global'' =>
+        let fix update_flow (flows : list FlowRateLimit) : list FlowRateLimit * bool :=
+          match flows with
+          | [] => 
+              let new_bucket := {| tb_capacity := 10000;
+                                  tb_tokens := 10000;
+                                  tb_rate := 1000;
+                                  tb_last_refill := stack.(rl_time) |} in
+              ([{| flow_src := src;
+                   flow_dst := dst;
+                   flow_sport := sport;
+                   flow_dport := dport;
+                   flow_bucket := new_bucket;
+                   flow_drops := 0 |}], true)
+          | f::rest =>
+              if andb (andb (ipv4_eq f.(flow_src) src) (ipv4_eq f.(flow_dst) dst))
+                     (andb (N.eqb f.(flow_sport) sport) (N.eqb f.(flow_dport) dport))
+              then
+                let bucket' := refill_bucket f.(flow_bucket) stack.(rl_time) in
+                match consume_tokens bucket' packet_size with
+                | None => 
+                    ({| flow_src := f.(flow_src);
+                        flow_dst := f.(flow_dst);
+                        flow_sport := f.(flow_sport);
+                        flow_dport := f.(flow_dport);
+                        flow_bucket := bucket';
+                        flow_drops := f.(flow_drops) + 1 |} :: rest, false)
+                | Some bucket'' =>
+                    ({| flow_src := f.(flow_src);
+                        flow_dst := f.(flow_dst);
+                        flow_sport := f.(flow_sport);
+                        flow_dport := f.(flow_dport);
+                        flow_bucket := bucket'';
+                        flow_drops := f.(flow_drops) |} :: rest, true)
+                end
+              else
+                let (rest', allowed) := update_flow rest in
+                (f :: rest', allowed)
+          end in
+        let (flows', allowed) := update_flow stack.(rl_flow_limits) in
+        (allowed, {| rl_base := stack.(rl_base);
+                     rl_global_bucket := global'';
+                     rl_flow_limits := flows';
+                     rl_leaky := stack.(rl_leaky);
+                     rl_time := stack.(rl_time) |})
+    end.
+
+  (* Add packet to leaky bucket *)
+  Definition enqueue_leaky (bucket : LeakyBucket) (packet : list byte) (now : N)
+    : option LeakyBucket :=
+    let packet_size := lenN packet in
+    if N.leb (bucket.(lb_buffer_size) + packet_size) bucket.(lb_max_buffer)
+    then Some {| lb_rate := bucket.(lb_rate);
+                 lb_buffer := bucket.(lb_buffer) ++ [(now, packet)];
+                 lb_buffer_size := bucket.(lb_buffer_size) + packet_size;
+                 lb_max_buffer := bucket.(lb_max_buffer);
+                 lb_last_drain := bucket.(lb_last_drain) |}
+    else None.
+
+  (* Drain leaky bucket *)
+  Definition drain_leaky (bucket : LeakyBucket) (now : N) 
+    : list (list byte) * LeakyBucket :=
+    let elapsed := now - bucket.(lb_last_drain) in
+    let bytes_to_send := elapsed * bucket.(lb_rate) in
+    let fix drain (buffer : list (N * list byte)) (remaining : N) 
+      : list (list byte) * list (N * list byte) :=
+      match buffer with
+      | [] => ([], [])
+      | (_, pkt)::rest =>
+          let pkt_size := lenN pkt in
+          if N.leb pkt_size remaining
+          then 
+            let (sent, kept) := drain rest (remaining - pkt_size) in
+            (pkt :: sent, kept)
+          else ([], buffer)
+      end in
+    let (to_send, to_keep) := drain bucket.(lb_buffer) bytes_to_send in
+    let new_size := fold_left (fun acc p => acc + lenN p) 
+                              (map snd to_keep) 0 in
+    (to_send, {| lb_rate := bucket.(lb_rate);
+                 lb_buffer := to_keep;
+                 lb_buffer_size := new_size;
+                 lb_max_buffer := bucket.(lb_max_buffer);
+                 lb_last_drain := now |}).
+
+  (* Apply congestion control with ECN marking *)
+  Definition apply_congestion_control (stack : NetworkStackRL) (packet : list byte)
+    : list byte * NetworkStackRL :=
+    let buffer_usage := stack.(rl_leaky).(lb_buffer_size) * 100 / 
+                       stack.(rl_leaky).(lb_max_buffer) in
+    let current_ecn := get_ecn_from_ip_packet packet in
+    let marked_packet := 
+      if N.ltb 80 buffer_usage
+      then 
+        (* Mark with CE if buffer > 80% and packet is ECT *)
+        if orb (N.eqb current_ecn ECN_ECT0) (N.eqb current_ecn ECN_ECT1)
+        then set_ecn_in_ip_packet packet ECN_CE
+        else packet  (* Not ECN capable, cannot mark *)
+      else if N.ltb 50 buffer_usage
+      then
+        (* Random Early Detection: mark with probability based on buffer fill *)
+        let mark_prob := (buffer_usage - 50) * 3 in  (* 0-90% probability *)
+        if N.ltb (N.modulo (stack.(rl_time) * 97) 100) mark_prob
+        then 
+          if orb (N.eqb current_ecn ECN_ECT0) (N.eqb current_ecn ECN_ECT1)
+          then set_ecn_in_ip_packet packet ECN_CE
+          else packet
+        else packet
+      else packet in
+    (marked_packet, stack).
+
+(* Rate-limited send *)
+  Definition send_with_rate_limit (stack : NetworkStackRL) 
+                                  (src dst : IPv4) (sport dport : word16)
+                                  (packet : list byte)
+    : NetworkStackRL :=
+    let (allowed, stack') := check_rate_limit stack src dst sport dport (lenN packet) in
+    if allowed
+    then 
+      match enqueue_leaky stack'.(rl_leaky) packet stack'.(rl_time) with
+      | None => stack'  (* Leaky bucket full, drop *)
+      | Some leaky' =>
+          let (to_send, leaky'') := drain_leaky leaky' stack'.(rl_time) in
+          let stack'' := {| rl_base := stack'.(rl_base);
+                           rl_global_bucket := stack'.(rl_global_bucket);
+                           rl_flow_limits := stack'.(rl_flow_limits);
+                           rl_leaky := leaky'';
+                           rl_time := stack'.(rl_time) |} in
+          (* Send drained packets with ECN marking *)
+          fold_left (fun s pkt => 
+                      let (marked_pkt, s') := apply_congestion_control s pkt in
+                      match find_route s'.(rl_base) dst with
+                      | None => s'
+                      | Some (iface, _) =>
+                          {| rl_base := send_packet s'.(rl_base) iface.(if_index) marked_pkt;
+                             rl_global_bucket := s'.(rl_global_bucket);
+                             rl_flow_limits := s'.(rl_flow_limits);
+                             rl_leaky := s'.(rl_leaky);
+                             rl_time := s'.(rl_time) |}
+                      end) to_send stack''
+      end
+    else stack'.  (* Rate limited, drop *)
+
+End UDP_RateLimit.
+
+Section UDP_PathMTU.
+  Open Scope N_scope.
+
+  (* Path MTU Discovery state per destination *)
+  Record PathMTUEntry := {
+    pmtu_dst : IPv4;
+    pmtu_value : N;           (* Current path MTU estimate *)
+    pmtu_last_probe : N;       (* Time of last probe *)
+    pmtu_last_decrease : N;    (* Time of last PMTU decrease *)
+    pmtu_probe_size : N;       (* Size of next probe packet *)
+    pmtu_validated : bool      (* Has this PMTU been confirmed? *)
+  }.
+
+  (* PMTU Discovery configuration *)
+  Record PMTUConfig := {
+    pmtu_min_ipv4 : N;        (* 68 bytes minimum *)
+    pmtu_min_ipv6 : N;        (* 1280 bytes minimum *)
+    pmtu_max : N;              (* 65535 or higher for jumbograms *)
+    pmtu_probe_interval : N;   (* How often to probe for increases *)
+    pmtu_decrease_timeout : N  (* How long before trying to increase again *)
+  }.
+
+  (* Extended network stack with PMTU Discovery *)
+  Record NetworkStackPMTU := {
+    pmtu_base : NetworkStack;
+    pmtu_table : list PathMTUEntry;
+    pmtu_config : PMTUConfig;
+    pmtu_time : N
+  }.
+
+  (* Default PMTU configuration *)
+  Definition default_pmtu_config : PMTUConfig :=
+    {| pmtu_min_ipv4 := 68;
+       pmtu_min_ipv6 := 1280;
+       pmtu_max := 65535;
+       pmtu_probe_interval := 600;  (* 10 minutes *)
+       pmtu_decrease_timeout := 300 (* 5 minutes *) |}.
+
+  (* Find PMTU entry for destination *)
+  Definition find_pmtu_entry (table : list PathMTUEntry) (dst : IPv4) 
+    : option PathMTUEntry :=
+    let fix find (entries : list PathMTUEntry) : option PathMTUEntry :=
+      match entries with
+      | [] => None
+      | e::rest =>
+          if ipv4_eq e.(pmtu_dst) dst
+          then Some e
+          else find rest
+      end in
+    find table.
+
+  (* Get effective MTU for destination *)
+  Definition get_path_mtu (stack : NetworkStackPMTU) (dst : IPv4) : N :=
+    match find_pmtu_entry stack.(pmtu_table) dst with
+    | None => 
+        (* No entry, use interface MTU *)
+        match find_route stack.(pmtu_base) dst with
+        | None => 1500  (* Default Ethernet MTU *)
+        | Some (iface, _) => iface.(if_mtu)
+        end
+    | Some entry => entry.(pmtu_value)
+    end.
+
+  (* Process ICMP Packet Too Big message *)
+  Definition process_icmp_too_big (stack : NetworkStackPMTU) 
+                                  (dst : IPv4) (reported_mtu : N)
+    : NetworkStackPMTU :=
+    let new_mtu := N.max reported_mtu stack.(pmtu_config).(pmtu_min_ipv4) in
+    let fix update_table (entries : list PathMTUEntry) : list PathMTUEntry :=
+      match entries with
+      | [] => 
+          (* New entry *)
+          [{| pmtu_dst := dst;
+              pmtu_value := new_mtu;
+              pmtu_last_probe := stack.(pmtu_time);
+              pmtu_last_decrease := stack.(pmtu_time);
+              pmtu_probe_size := new_mtu;
+              pmtu_validated := false |}]
+      | e::rest =>
+          if ipv4_eq e.(pmtu_dst) dst
+          then
+            (* Update existing entry - only decrease MTU *)
+            if N.ltb new_mtu e.(pmtu_value)
+            then {| pmtu_dst := e.(pmtu_dst);
+                    pmtu_value := new_mtu;
+                    pmtu_last_probe := e.(pmtu_last_probe);
+                    pmtu_last_decrease := stack.(pmtu_time);
+                    pmtu_probe_size := new_mtu;
+                    pmtu_validated := false |} :: rest
+            else e :: rest
+          else e :: update_table rest
+      end in
+    {| pmtu_base := stack.(pmtu_base);
+       pmtu_table := update_table stack.(pmtu_table);
+       pmtu_config := stack.(pmtu_config);
+       pmtu_time := stack.(pmtu_time) |}.
+
+  (* Try to increase PMTU by probing *)
+  Definition probe_pmtu_increase (stack : NetworkStackPMTU) (dst : IPv4)
+    : N * NetworkStackPMTU :=
+    match find_pmtu_entry stack.(pmtu_table) dst with
+    | None => 
+        (* No entry, use interface MTU *)
+        match find_route stack.(pmtu_base) dst with
+        | None => (1500, stack)
+        | Some (iface, _) => (iface.(if_mtu), stack)
+        end
+    | Some entry =>
+        (* Check if it's time to probe *)
+        let time_since_probe := stack.(pmtu_time) - entry.(pmtu_last_probe) in
+        let time_since_decrease := stack.(pmtu_time) - entry.(pmtu_last_decrease) in
+        if andb (N.ltb stack.(pmtu_config).(pmtu_probe_interval) time_since_probe)
+                (N.ltb stack.(pmtu_config).(pmtu_decrease_timeout) time_since_decrease)
+        then
+          (* Time to probe for larger MTU *)
+          let probe_size := N.min (entry.(pmtu_value) + 100) 
+                                  stack.(pmtu_config).(pmtu_max) in
+          let fix update_table (entries : list PathMTUEntry) : list PathMTUEntry :=
+            match entries with
+            | [] => []
+            | e::rest =>
+                if ipv4_eq e.(pmtu_dst) dst
+                then {| pmtu_dst := e.(pmtu_dst);
+                        pmtu_value := e.(pmtu_value);
+                        pmtu_last_probe := stack.(pmtu_time);
+                        pmtu_last_decrease := e.(pmtu_last_decrease);
+                        pmtu_probe_size := probe_size;
+                        pmtu_validated := e.(pmtu_validated) |} :: rest
+                else e :: update_table rest
+            end in
+          (probe_size,
+           {| pmtu_base := stack.(pmtu_base);
+              pmtu_table := update_table stack.(pmtu_table);
+              pmtu_config := stack.(pmtu_config);
+              pmtu_time := stack.(pmtu_time) |})
+        else
+          (* Not time to probe yet *)
+          (entry.(pmtu_value), stack)
+    end.
+
+  (* Mark PMTU as validated when packet succeeds *)
+  Definition validate_pmtu (stack : NetworkStackPMTU) (dst : IPv4) (size : N)
+    : NetworkStackPMTU :=
+    let fix update_table (entries : list PathMTUEntry) : list PathMTUEntry :=
+      match entries with
+      | [] => 
+          (* Create new validated entry *)
+          [{| pmtu_dst := dst;
+              pmtu_value := size;
+              pmtu_last_probe := stack.(pmtu_time);
+              pmtu_last_decrease := 0;
+              pmtu_probe_size := size;
+              pmtu_validated := true |}]
+      | e::rest =>
+          if ipv4_eq e.(pmtu_dst) dst
+          then
+            if N.leb size e.(pmtu_value)
+            then
+              (* Packet size fits in current PMTU, mark as validated *)
+              {| pmtu_dst := e.(pmtu_dst);
+                 pmtu_value := e.(pmtu_value);
+                 pmtu_last_probe := e.(pmtu_last_probe);
+                 pmtu_last_decrease := e.(pmtu_last_decrease);
+                 pmtu_probe_size := e.(pmtu_probe_size);
+                 pmtu_validated := true |} :: rest
+            else
+              (* Successful probe, increase PMTU *)
+              {| pmtu_dst := e.(pmtu_dst);
+                 pmtu_value := size;
+                 pmtu_last_probe := stack.(pmtu_time);
+                 pmtu_last_decrease := e.(pmtu_last_decrease);
+                 pmtu_probe_size := size;
+                 pmtu_validated := true |} :: rest
+          else e :: update_table rest
+      end in
+    {| pmtu_base := stack.(pmtu_base);
+       pmtu_table := update_table stack.(pmtu_table);
+       pmtu_config := stack.(pmtu_config);
+       pmtu_time := stack.(pmtu_time) |}.
+
+  (* Send with PMTU Discovery *)
+  Definition send_with_pmtu (stack : NetworkStackPMTU) (sock_fd : socket_fd)
+                           (dst_addr : IPv4) (dst_port : word16) (data : list byte)
+    : NetworkStackPMTU :=
+    (* Get current PMTU for destination *)
+    let mtu := get_path_mtu stack dst_addr in
+    let packet_size := 20 + 8 + lenN data in  (* IP + UDP + data *)
+    
+    if N.leb packet_size mtu
+    then
+      (* Packet fits, send normally *)
+      let stack' := {| pmtu_base := send_udp stack.(pmtu_base) sock_fd dst_addr dst_port data;
+                       pmtu_table := stack.(pmtu_table);
+                       pmtu_config := stack.(pmtu_config);
+                       pmtu_time := stack.(pmtu_time) |} in
+      validate_pmtu stack' dst_addr packet_size
+    else
+      (* Packet too big, need to fragment or probe *)
+      let (probe_mtu, stack') := probe_pmtu_increase stack dst_addr in
+      if N.leb packet_size probe_mtu
+      then
+        (* Try sending at probe size with DF bit set *)
+        let stack'' := {| pmtu_base := send_udp stack'.(pmtu_base) sock_fd dst_addr dst_port data;
+                          pmtu_table := stack'.(pmtu_table);
+                          pmtu_config := stack'.(pmtu_config);
+                          pmtu_time := stack'.(pmtu_time) |} in
+        validate_pmtu stack'' dst_addr packet_size
+      else
+        (* Fragment at current PMTU *)
+        {| pmtu_base := send_udp_with_fragmentation stack'.(pmtu_base) sock_fd dst_addr dst_port data;
+           pmtu_table := stack'.(pmtu_table);
+           pmtu_config := stack'.(pmtu_config);
+           pmtu_time := stack'.(pmtu_time) |}.
+
+  (* Periodic PMTU aging - remove stale entries *)
+  Definition age_pmtu_entries (stack : NetworkStackPMTU) : NetworkStackPMTU :=
+    let max_age := 3600 in  (* 1 hour *)
+    let fix filter_recent (entries : list PathMTUEntry) : list PathMTUEntry :=
+      match entries with
+      | [] => []
+      | e::rest =>
+          if N.ltb (stack.(pmtu_time) - e.(pmtu_last_probe)) max_age
+          then e :: filter_recent rest
+          else filter_recent rest
+      end in
+    {| pmtu_base := stack.(pmtu_base);
+       pmtu_table := filter_recent stack.(pmtu_table);
+       pmtu_config := stack.(pmtu_config);
+       pmtu_time := stack.(pmtu_time) |}.
+
+End UDP_PathMTU.
+
+(* Final Comprehensive Extraction to OCaml *)
+Require Extraction.
+Require Import ExtrOcamlBasic.
+Require Import ExtrOcamlNatInt.
+
+(* Extract Coq types to OCaml *)
+Extract Inductive bool => "bool" [ "true" "false" ].
+Extract Inductive list => "list" [ "[]" "(::)" ].
+Extract Inductive prod => "(*)" [ "(,)" ].
+Extract Inductive sum => "(,) option" [ "(fun x -> (x, None))" "(fun e -> (None, Some e))" ].
+Extract Inductive option => "option" [ "Some" "None" ].
+Extract Inductive unit => "unit" [ "()" ].
+
+(* Map N to int *)
+Extract Inductive N => "int"
+  [ "0" "(fun p -> Obj.magic p)" ]
+  "(fun f0 fp n -> if n = 0 then f0 () else fp (Obj.magic n))".
+
+Extract Constant N.add => "(+)".
+Extract Constant N.sub => "(fun a b -> max 0 (a - b))".
+Extract Constant N.mul => "( * )".
+Extract Constant N.div => "(/)".
+Extract Constant N.modulo => "(mod)".
+Extract Constant N.eqb => "(=)".
+Extract Constant N.leb => "(<=)".
+Extract Constant N.ltb => "(<)".
+Extract Constant N.land => "(land)".
+Extract Constant N.max => "max".
+Extract Constant N.min => "min".
+
+(* Extract nat operations *)
+Extract Inductive nat => "int"
+  [ "0" "(fun n -> n + 1)" ]
+  "(fun f0 fs n -> if n = 0 then f0 () else fs (n - 1))".
+
+(* Complete UDP Stack Extraction *)
+Extraction "udp_complete.ml"
+  (* Core Protocol *)
+  encode_udp_ipv4
+  decode_udp_ipv4
+  encode_udp_ipv6
+  decode_udp_ipv6
+  compute_udp_checksum_ipv4
+  compute_udp_checksum_ipv6
+  verify_checksum_ipv4
+  verify_checksum_ipv6
+  
+  (* Fragmentation *)
+  reassemble_fragments
+  reassemble_fragments_v6
+  decode_udp_ipv4_fragmented
+  decode_udp_ipv6_fragmented
+  fragment_packet
+  send_udp_with_fragmentation
+  
+  (* Socket API *)
+  socket
+  bind
+  sendto
+  recvfrom
+  deliver_to_socket
+  close
+  
+  (* Network Layer *)
+  find_route
+  send_packet
+  receive_packet
+  process_udp_rx
+  send_udp
+  
+  (* Multicast *)
+  join_mcast_group
+  leave_mcast_group
+  process_igmp_query
+  join_mcast_group_v6
+  send_mld_report
+  
+  (* NAT Traversal *)
+  nat_outbound
+  nat_inbound
+  find_nat_mapping
+  create_nat_mapping
+  cleanup_nat_mappings
+  
+  (* Rate Limiting *)
+  check_rate_limit
+  send_with_rate_limit
+  apply_congestion_control
+  refill_bucket
+  consume_tokens
+  
+  (* Path MTU Discovery *)
+  get_path_mtu
+  process_icmp_too_big
+  probe_pmtu_increase
+  validate_pmtu
+  send_with_pmtu
+  age_pmtu_entries
+  
+  (* Configuration *)
+  defaults_ipv4
+  defaults_ipv6
+  ipv4_hardened_default
+  default_pmtu_config
+  
+  (* Tests *)
+  run_all_tests.
+
 (** ****************************************************************************
 
     ## Future Work
     
     ### 1. Extraction and Testing
-    - OCaml extraction for executable verified code
     - QuickChick property-based testing framework
     - Performance benchmarks against standard implementations
     
@@ -6458,4 +7034,3 @@ End UDP_NAT.
     - Full verified socket API
     - ICMPv6 error handling
     **************************************************************************** *)
-
