@@ -5333,6 +5333,507 @@ Section UDP_Hardened_Examples.
 
 End UDP_Hardened_Examples.
 
+Section UDP_IP_Fragmentation.
+  Open Scope N_scope.
+
+  Record IPFragment := {
+    ident : word16;
+    offset : word16;
+    more : bool;
+    payload : list byte
+  }.
+
+  Fixpoint insert_sorted (f : IPFragment) (fs : list IPFragment) : list IPFragment :=
+    match fs with
+    | [] => [f]
+    | h::t => 
+        if offset f <=? offset h 
+        then f :: fs
+        else h :: insert_sorted f t
+    end.
+
+  Fixpoint insertion_sort (fs : list IPFragment) : list IPFragment :=
+    match fs with
+    | [] => []
+    | h::t => insert_sorted h (insertion_sort t)
+    end.
+
+  Fixpoint check_and_concat (fs : list IPFragment) (expected_offset : N) : option (list byte) :=
+    match fs with
+    | [] => Some []
+    | f::rest =>
+        if N.eqb (offset f) expected_offset then
+          let next_offset := expected_offset + lenN (payload f) in
+          match check_and_concat rest next_offset with
+          | None => None
+          | Some rest_data => Some (payload f ++ rest_data)
+          end
+        else None
+    end.
+
+  Definition reassemble_fragments (frags : list IPFragment) : option (list byte) :=
+    let sorted := insertion_sort frags in
+    match sorted with
+    | [] => None
+    | f::_ => 
+        if N.eqb (offset f) 0 then
+          check_and_concat sorted 0
+        else None
+    end.
+
+  Definition decode_udp_ipv4_fragmented 
+    (src dst : IPv4) (frags : list IPFragment) : result Decoded DecodeError :=
+    match reassemble_fragments frags with
+    | None => Err BadLength
+    | Some complete_datagram => decode_udp_ipv4 defaults_ipv4 src dst complete_datagram
+    end.
+
+End UDP_IP_Fragmentation.
+
+Section UDP_IPv6_Fragmentation.
+  Open Scope N_scope.
+
+  (* IPv6 uses Fragment Extension Header *)
+  Record IPv6Fragment := {
+    v6_ident : N;           (* 32-bit identification *)
+    v6_offset : word16;     (* Fragment offset * 8 *)
+    v6_more : bool;         (* More fragments flag *)
+    v6_payload : list byte  (* Fragment data *)
+  }.
+
+  Fixpoint insert_sorted_v6 (f : IPv6Fragment) (fs : list IPv6Fragment) : list IPv6Fragment :=
+    match fs with
+    | [] => [f]
+    | h::t => 
+        if v6_offset f <=? v6_offset h 
+        then f :: fs
+        else h :: insert_sorted_v6 f t
+    end.
+
+  Fixpoint insertion_sort_v6 (fs : list IPv6Fragment) : list IPv6Fragment :=
+    match fs with
+    | [] => []
+    | h::t => insert_sorted_v6 h (insertion_sort_v6 t)
+    end.
+
+  Fixpoint check_and_concat_v6 (fs : list IPv6Fragment) (expected_offset : N) : option (list byte) :=
+    match fs with
+    | [] => Some []
+    | f::rest =>
+        if N.eqb (v6_offset f) expected_offset then
+          let next_offset := expected_offset + lenN (v6_payload f) in
+          match check_and_concat_v6 rest next_offset with
+          | None => None
+          | Some rest_data => Some (v6_payload f ++ rest_data)
+          end
+        else None
+    end.
+
+  Definition reassemble_fragments_v6 (frags : list IPv6Fragment) : option (list byte) :=
+    let sorted := insertion_sort_v6 frags in
+    match sorted with
+    | [] => None
+    | f::_ => 
+        if N.eqb (v6_offset f) 0 then
+          check_and_concat_v6 sorted 0
+        else None
+    end.
+
+  Definition decode_udp_ipv6_fragmented 
+    (src dst : IPv6) (frags : list IPv6Fragment) : result Decoded DecodeError :=
+    match reassemble_fragments_v6 frags with
+    | None => Err BadLength
+    | Some complete_datagram => decode_udp_ipv6 src dst complete_datagram
+    end.
+
+End UDP_IPv6_Fragmentation.
+
+Section UDP_Socket_API.
+  Open Scope N_scope.
+
+  (* Socket file descriptor *)
+  Definition socket_fd := N.
+
+  (* Socket state *)
+  Record UDPSocket := {
+    fd : socket_fd;
+    local_addr : IPv4;
+    local_port : word16;
+    bound : bool;
+    receive_buffer : list (IPv4 * word16 * list byte);
+    send_buffer : list (IPv4 * word16 * list byte)
+  }.
+
+  (* Global socket table *)
+  Definition socket_table := list UDPSocket.
+
+  (* Check if IPv4 address is INADDR_ANY (0.0.0.0) *)
+  Definition is_any_addr (ip : IPv4) : bool :=
+    andb (andb (N.eqb ip.(a0) 0) (N.eqb ip.(a1) 0))
+         (andb (N.eqb ip.(a2) 0) (N.eqb ip.(a3) 0)).
+
+  (* Check if two IPv4 addresses are equal *)
+  Definition ipv4_eq (ip1 ip2 : IPv4) : bool :=
+    andb (andb (N.eqb ip1.(a0) ip2.(a0)) (N.eqb ip1.(a1) ip2.(a1)))
+         (andb (N.eqb ip1.(a2) ip2.(a2)) (N.eqb ip1.(a3) ip2.(a3))).
+
+  (* Create a new UDP socket *)
+  Definition socket (next_fd : socket_fd) : UDPSocket * socket_fd :=
+    ({| fd := next_fd;
+        local_addr := mkIPv4 0 0 0 0;
+        local_port := 0;
+        bound := false;
+        receive_buffer := [];
+        send_buffer := [] |},
+     next_fd + 1).
+
+  (* Bind socket to address and port *)
+  Definition bind (s : UDPSocket) (addr : IPv4) (port : word16) : result UDPSocket DecodeError :=
+    if s.(bound) then inr BadLength  (* Already bound *)
+    else inl {| fd := s.(fd);
+                local_addr := addr;
+                local_port := port;
+                bound := true;
+                receive_buffer := s.(receive_buffer);
+                send_buffer := s.(send_buffer) |}.
+
+  (* Send datagram *)
+  Definition sendto (s : UDPSocket) (dst_addr : IPv4) (dst_port : word16) (data : list byte) 
+    : result (UDPSocket * list byte) EncodeError :=
+    match encode_udp_ipv4 defaults_ipv4 s.(local_addr) dst_addr s.(local_port) dst_port data with
+    | inl wire => 
+        inl ({| fd := s.(fd);
+                local_addr := s.(local_addr);
+                local_port := s.(local_port);
+                bound := s.(bound);
+                receive_buffer := s.(receive_buffer);
+                send_buffer := s.(send_buffer) ++ [(dst_addr, dst_port, data)] |},
+             wire)
+    | inr e => inr e
+    end.
+
+  (* Receive datagram *)
+  Definition recvfrom (s : UDPSocket) : option (IPv4 * word16 * list byte * UDPSocket) :=
+    match s.(receive_buffer) with
+    | [] => None
+    | (src_addr, src_port, data) :: rest =>
+        Some (src_addr, src_port, data,
+              {| fd := s.(fd);
+                 local_addr := s.(local_addr);
+                 local_port := s.(local_port);
+                 bound := s.(bound);
+                 receive_buffer := rest;
+                 send_buffer := s.(send_buffer) |})
+    end.
+
+  (* Deliver incoming packet to socket *)
+  Definition deliver_to_socket (s : UDPSocket) (src_addr : IPv4) (src_port : word16) 
+                               (dst_addr : IPv4) (dst_port : word16) (data : list byte)
+    : option UDPSocket :=
+    if andb (N.eqb s.(local_port) dst_port)
+            (orb (is_any_addr s.(local_addr))
+                 (ipv4_eq s.(local_addr) dst_addr))
+    then Some {| fd := s.(fd);
+                 local_addr := s.(local_addr);
+                 local_port := s.(local_port);
+                 bound := s.(bound);
+                 receive_buffer := s.(receive_buffer) ++ [(src_addr, src_port, data)];
+                 send_buffer := s.(send_buffer) |}
+    else None.
+
+  (* Close socket *)
+  Definition close (s : UDPSocket) : unit := tt.
+
+End UDP_Socket_API.
+
+Section UDP_Test_Suite.
+  Open Scope N_scope.
+
+  (* List equality helper *)
+  Fixpoint list_eqb (xs ys : list N) : bool :=
+    match xs, ys with
+    | [], [] => true
+    | x::xs', y::ys' => andb (N.eqb x y) (list_eqb xs' ys')
+    | _, _ => false
+    end.
+
+  (* RFC 768 Example - from the original specification *)
+  Definition rfc768_test : bool :=
+    let src := mkIPv4 192 168 1 1 in
+    let dst := mkIPv4 192 168 1 2 in
+    let data := [0; 1; 2; 3; 4; 5; 6; 7] in
+    match encode_udp_ipv4 defaults_ipv4 src dst 1234 5678 data with
+    | inl wire =>
+        match decode_udp_ipv4 defaults_ipv4 src dst wire with
+        | inl (sp, dp, payload) => 
+            andb (andb (N.eqb sp 1234) (N.eqb dp 5678))
+                 (list_eqb data payload)
+        | _ => false
+        end
+    | _ => false
+    end.
+
+  (* DNS query test vector *)
+  Definition dns_payload := 
+    [170; 170; 1; 0; 0; 1; 0; 0;     (* Transaction ID, flags, counts *)
+     0; 0; 0; 0; 6; 103; 111; 111;   (* google *)
+     103; 108; 101; 3; 99; 111; 109; 0;  (* .com *)
+     0; 1; 0; 1].                     (* Type A, Class IN *)
+
+  Definition dns_test : bool :=
+    let src := mkIPv4 192 168 1 100 in
+    let dst := mkIPv4 8 8 8 8 in
+    match encode_udp_ipv4 defaults_ipv4 src dst 4660 53 dns_payload with
+    | inl wire =>
+        match decode_udp_ipv4 defaults_ipv4 src dst wire with
+        | inl (sp, dp, payload) =>
+            andb (andb (N.eqb sp 4660) (N.eqb dp 53))
+                 (N.eqb (lenN payload) 28)
+        | _ => false
+        end
+    | _ => false
+    end.
+
+  (* Fragmentation test *)
+  Definition frag_test : bool :=
+    let test_data := [1; 2; 3; 4; 5; 6; 7; 8; 9; 10] in
+    let frag1 := {| ident := 42; offset := 0; more := true; 
+                    payload := [1; 2; 3; 4; 5] |} in
+    let frag2 := {| ident := 42; offset := 5; more := false;
+                    payload := [6; 7; 8; 9; 10] |} in
+    match reassemble_fragments [frag2; frag1] with  (* Test out-of-order *)
+    | Some reassembled => list_eqb reassembled test_data
+    | None => false
+    end.
+
+  (* Socket API test *)
+  Definition socket_test : bool :=
+    let (sock, _) := socket 0 in
+    match bind sock (mkIPv4 127 0 0 1) 8080 with
+    | inl bound_sock =>
+        match sendto bound_sock (mkIPv4 127 0 0 1) 8081 [1; 2; 3] with
+        | inl (sent_sock, wire) => 
+            match decode_udp_ipv4 defaults_ipv4 
+                    (mkIPv4 127 0 0 1) (mkIPv4 127 0 0 1) wire with
+            | inl (sp, dp, _) => andb (N.eqb sp 8080) (N.eqb dp 8081)
+            | _ => false
+            end
+        | _ => false
+        end
+    | _ => false
+    end.
+
+  (* Run all tests *)
+  Definition run_all_tests : bool :=
+    andb (andb (andb rfc768_test dns_test) frag_test) socket_test.
+
+  (* Should evaluate to true *)
+  Compute run_all_tests.
+
+End UDP_Test_Suite.
+
+Section UDP_Network_Interface.
+  Open Scope N_scope.
+
+  (* Network interface *)
+  Record NetInterface := {
+    if_name : list byte;
+    if_index : N;
+    if_addr : IPv4;
+    if_netmask : IPv4;
+    if_mtu : N;
+    if_flags : N;
+    tx_packets : N;
+    rx_packets : N;
+    tx_queue : list (list byte);
+    rx_queue : list (list byte)
+  }.
+
+  (* Routing table entry *)
+  Record Route := {
+    rt_dest : IPv4;
+    rt_mask : IPv4;
+    rt_gateway : IPv4;
+    rt_interface : N
+  }.
+
+  (* Network stack state *)
+  Record NetworkStack := {
+    interfaces : list NetInterface;
+    sockets : socket_table;
+    next_fd : socket_fd;
+    routing_table : list Route
+  }.
+
+  (* Apply network mask to IP address *)
+  Definition apply_mask (ip mask : IPv4) : IPv4 :=
+    mkIPv4 (N.land ip.(a0) mask.(a0))
+           (N.land ip.(a1) mask.(a1))
+           (N.land ip.(a2) mask.(a2))
+           (N.land ip.(a3) mask.(a3)).
+
+  (* Count bits in a byte (bounded to 8 iterations) *)
+  Fixpoint count_bits_bounded (n : N) (fuel : nat) : N :=
+    match fuel with
+    | O => 0
+    | S fuel' =>
+        if N.eqb n 0 then 0
+        else (N.modulo n 2) + count_bits_bounded (N.div n 2) fuel'
+    end.
+
+  (* Count number of 1 bits in mask (prefix length) *)
+  Definition mask_prefix_len (mask : IPv4) : N :=
+    count_bits_bounded mask.(a0) 8 + 
+    count_bits_bounded mask.(a1) 8 + 
+    count_bits_bounded mask.(a2) 8 + 
+    count_bits_bounded mask.(a3) 8.
+
+  (* Find route for destination with longest prefix match *)
+  Definition find_route (stack : NetworkStack) (dst : IPv4) : option (NetInterface * IPv4) :=
+    let fix find_best (routes : list Route) (best : option (Route * N)) : option (Route * N) :=
+      match routes with
+      | [] => best
+      | r::rest =>
+          if ipv4_eq (apply_mask dst r.(rt_mask)) (apply_mask r.(rt_dest) r.(rt_mask))
+          then 
+            let prefix := mask_prefix_len r.(rt_mask) in
+            match best with
+            | None => find_best rest (Some (r, prefix))
+            | Some (_, best_prefix) =>
+                if N.ltb best_prefix prefix  (* prefix > best_prefix *)
+                then find_best rest (Some (r, prefix))
+                else find_best rest best
+            end
+          else find_best rest best
+      end in
+    match find_best stack.(routing_table) None with
+    | None => None
+    | Some (route, _) =>
+        let fix find_interface (ifs : list NetInterface) : option NetInterface :=
+          match ifs with
+          | [] => None
+          | iface::rest =>
+              if N.eqb iface.(if_index) route.(rt_interface)
+              then Some iface
+              else find_interface rest
+          end in
+        match find_interface stack.(interfaces) with
+        | None => None
+        | Some iface => 
+            if is_any_addr route.(rt_gateway)
+            then Some (iface, dst)
+            else Some (iface, route.(rt_gateway))
+        end
+    end.
+
+  (* Send packet through interface *)
+  Definition send_packet (stack : NetworkStack) (if_idx : N) (packet : list byte) 
+    : NetworkStack :=
+    let fix update_if (ifs : list NetInterface) : list NetInterface :=
+      match ifs with
+      | [] => []
+      | iface::rest =>
+          if N.eqb iface.(if_index) if_idx
+          then {| if_name := iface.(if_name);
+                  if_index := iface.(if_index);
+                  if_addr := iface.(if_addr);
+                  if_netmask := iface.(if_netmask);
+                  if_mtu := iface.(if_mtu);
+                  if_flags := iface.(if_flags);
+                  tx_packets := iface.(tx_packets) + 1;
+                  rx_packets := iface.(rx_packets);
+                  tx_queue := iface.(tx_queue) ++ [packet];
+                  rx_queue := iface.(rx_queue) |} :: rest
+          else iface :: update_if rest
+      end in
+    {| interfaces := update_if stack.(interfaces);
+       sockets := stack.(sockets);
+       next_fd := stack.(next_fd);
+       routing_table := stack.(routing_table) |}.
+
+  (* Receive packet from interface *)
+  Definition receive_packet (stack : NetworkStack) (if_idx : N) 
+    : option (list byte * NetworkStack) :=
+    let fix find_and_pop (ifs : list NetInterface) 
+      : option (list byte * list NetInterface) :=
+      match ifs with
+      | [] => None
+      | iface::rest =>
+          if N.eqb iface.(if_index) if_idx
+          then match iface.(rx_queue) with
+               | [] => None
+               | pkt::queue' =>
+                   Some (pkt,
+                        {| if_name := iface.(if_name);
+                           if_index := iface.(if_index);
+                           if_addr := iface.(if_addr);
+                           if_netmask := iface.(if_netmask);
+                           if_mtu := iface.(if_mtu);
+                           if_flags := iface.(if_flags);
+                           tx_packets := iface.(tx_packets);
+                           rx_packets := iface.(rx_packets) + 1;
+                           tx_queue := iface.(tx_queue);
+                           rx_queue := queue' |} :: rest)
+               end
+          else match find_and_pop rest with
+               | None => None
+               | Some (pkt, rest') => Some (pkt, iface :: rest')
+               end
+      end in
+    match find_and_pop stack.(interfaces) with
+    | None => None
+    | Some (pkt, ifs') =>
+        Some (pkt, {| interfaces := ifs';
+                      sockets := stack.(sockets);
+                      next_fd := stack.(next_fd);
+                      routing_table := stack.(routing_table) |})
+    end.
+
+  (* Process incoming UDP packet *)
+  Definition process_udp_rx (stack : NetworkStack) (src dst : IPv4) (udp_data : list byte)
+    : NetworkStack :=
+    match decode_udp_ipv4 defaults_ipv4 src dst udp_data with
+    | inl (src_port, dst_port, payload) =>
+        let fix deliver_to_sockets (socks : socket_table) : socket_table :=
+          match socks with
+          | [] => []
+          | s::rest =>
+              match deliver_to_socket s src src_port dst dst_port payload with
+              | None => s :: deliver_to_sockets rest
+              | Some s' => s' :: rest
+              end
+          end in
+        {| interfaces := stack.(interfaces);
+           sockets := deliver_to_sockets stack.(sockets);
+           next_fd := stack.(next_fd);
+           routing_table := stack.(routing_table) |}
+    | inr _ => stack
+    end.
+
+(* Complete send operation: socket -> interface *)
+  Definition send_udp (stack : NetworkStack) (sock_fd : socket_fd)  (* renamed parameter *)
+                      (dst_addr : IPv4) (dst_port : word16) (data : list byte)
+    : NetworkStack :=
+    let fix find_socket (socks : socket_table) : option UDPSocket :=
+      match socks with
+      | [] => None
+      | s::rest => if N.eqb s.(fd) sock_fd then Some s else find_socket rest
+      end in
+    match find_socket stack.(sockets) with
+    | None => stack
+    | Some sock =>
+        match find_route stack dst_addr with
+        | None => stack
+        | Some (iface, next_hop) =>
+            match sendto sock dst_addr dst_port data with
+            | inl (_, wire) => send_packet stack iface.(if_index) wire
+            | inr _ => stack
+            end
+        end
+    end.
+
+End UDP_Network_Interface.
+
 (** ****************************************************************************
     
     RFC 768 UDP/IPv4/IPv6 Formal Verification in Coq
