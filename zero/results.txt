@@ -1,0 +1,278 @@
+============================================================
+ZERO CHECKSUM PATTERN ANALYSIS
+============================================================
+
+Search Statistics:
+  Total attempts: 6,595,872
+  Zero checksums found: 100
+  Success rate: 0.00001516
+  Expected rate: 0.00001526
+  Ratio to expected: 0.9936
+
+Port Distribution:
+  Source ports - Min: 4112, Max: 64109, Avg: 36428.2
+  Dest ports - Min: 835, Max: 63642, Avg: 34672.4
+
+Data Length Distribution:
+   1 bytes:   6 occurrences (6.0%)
+   2 bytes:   7 occurrences (7.0%)
+   3 bytes:   4 occurrences (4.0%)
+   4 bytes:   3 occurrences (3.0%)
+   5 bytes:   9 occurrences (9.0%)
+   6 bytes:   5 occurrences (5.0%)
+   7 bytes:   4 occurrences (4.0%)
+   8 bytes:   5 occurrences (5.0%)
+   9 bytes:   3 occurrences (3.0%)
+  10 bytes:   7 occurrences (7.0%)
+  11 bytes:   4 occurrences (4.0%)
+  12 bytes:   5 occurrences (5.0%)
+  13 bytes:   5 occurrences (5.0%)
+  14 bytes:   5 occurrences (5.0%)
+  15 bytes:   5 occurrences (5.0%)
+  16 bytes:   3 occurrences (3.0%)
+  17 bytes:  10 occurrences (10.0%)
+  18 bytes:   3 occurrences (3.0%)
+  19 bytes:   4 occurrences (4.0%)
+  20 bytes:   3 occurrences (3.0%)
+
+Attempts to Find Distribution:
+  Min: 92,871
+  Max: 6,595,871
+  Avg: 3,110,450.5
+  Median: 3,091,876
+
+Most common bytes in zero-checksum payloads:
+  0xbc:  12 occurrences (1.19%)
+  0xf6:  10 occurrences (0.99%)
+  0x19:  10 occurrences (0.99%)
+  0x13:   9 occurrences (0.89%)
+  0xb8:   9 occurrences (0.89%)
+  0x0b:   9 occurrences (0.89%)
+  0x15:   9 occurrences (0.89%)
+  0x8f:   8 occurrences (0.80%)
+  0x47:   8 occurrences (0.80%)
+  0xd2:   8 occurrences (0.80%)
+
+============================================================
+SPECIFIC PATTERN TESTING
+============================================================
+
+all_zeros      :   0 zeros out of 100 (0.0000%)
+
+all_ones       :   0 zeros out of 100 (0.0000%)
+
+alternating_01 :   0 zeros out of 100 (0.0000%)
+
+alternating_10 :   0 zeros out of 100 (0.0000%)
+
+ascending      :   0 zeros out of 100 (0.0000%)
+
+descending     :   0 zeros out of 100 (0.0000%)
+
+powers_of_2    :   0 zeros out of 100 (0.0000%)
+
+fibonacci      :   0 zeros out of 100 (0.0000%)
+
+============================================================
+CHECKSUM VALUE DISTRIBUTION
+============================================================
+
+Total packets tested: 100,000
+Unique checksums seen: 51,209
+Expected unique values: ~49664
+
+Most frequent checksums:
+  0xff22:   10 times (0.0100%)
+  0xfbe1:    9 times (0.0090%)
+  0x47f9:    9 times (0.0090%)
+  0x7f44:    8 times (0.0080%)
+  0xb2c3:    8 times (0.0080%)
+  0x6943:    8 times (0.0080%)
+  0x0d54:    8 times (0.0080%)
+  0x0c52:    8 times (0.0080%)
+  0x168d:    8 times (0.0080%)
+  0xab8d:    8 times (0.0080%)
+
+Least frequent checksums (appeared only once):
+  Count: 21619 (32.99% of possible values)
+
+Distribution Statistics:
+  Mean frequency: 1.9528
+  Std deviation: 1.0598
+  Min frequency: 1
+  Max frequency: 10
+  Zero checksum count: 0
+
+============================================================
+COLLISION ANALYSIS
+============================================================
+
+Collisions for 10000 packets:
+  1 packets → same checksum: 10000 cases
+
+Example of 1 packets with checksum 0x4bfd:
+  Data: 0000
+
+============================================================
+PERFORMANCE ANALYSIS
+============================================================
+
+Timing for 10000 iterations per size:
+     1 bytes:   194.4 ns/op,    5145092 ops/sec,    5.15 MB/s
+     2 bytes:   168.9 ns/op,    5922416 ops/sec,   11.84 MB/s
+     4 bytes:   249.0 ns/op,    4016226 ops/sec,   16.06 MB/s
+     8 bytes:   368.1 ns/op,    2716579 ops/sec,   21.73 MB/s
+    16 bytes:   536.2 ns/op,    1864941 ops/sec,   29.84 MB/s
+    32 bytes:   924.9 ns/op,    1081210 ops/sec,   34.60 MB/s
+    64 bytes:  1593.5 ns/op,     627545 ops/sec,   40.16 MB/s
+   128 bytes:  2897.2 ns/op,     345157 ops/sec,   44.18 MB/s
+   256 bytes:  6118.2 ns/op,     163448 ops/sec,   41.84 MB/s
+   512 bytes: 18510.1 ns/op,      54025 ops/sec,   27.66 MB/s
+  1024 bytes: 27105.1 ns/op,      36893 ops/sec,   37.78 MB/s
+  1400 bytes: 36602.5 ns/op,      27321 ops/sec,   38.25 MB/s
+  1500 bytes: 42242.9 ns/op,      23673 ops/sec,   35.51 MB/s
+
+============================================================
+EDGE CASE TESTING
+============================================================
+
+Empty payload:
+  Data length: 0 bytes
+  Checksum: 0xd0db
+  Is zero: False
+
+Single byte 0x00:
+  Data length: 1 bytes
+  Checksum: 0xd0d9
+  Is zero: False
+
+Single byte 0xFF:
+  Data length: 1 bytes
+  Checksum: 0xd1d8
+  Is zero: False
+
+Two bytes 0x00:
+  Data length: 2 bytes
+  Checksum: 0xd0d7
+  Is zero: False
+
+Two bytes 0xFF:
+  Data length: 2 bytes
+  Checksum: 0xd0d7
+  Is zero: False
+
+Max UDP length:
+  Data length: 65527 bytes
+  Checksum: 0x7709
+  Is zero: False
+
+============================================================
+MINIMAL ZERO CHECKSUM PACKETS
+============================================================
+
+0-byte payload zero checksum found:
+  Attempts: 130,835
+  IPs: 245.88.216.172 → 244.57.157.199
+  Ports: 51246 → 55208
+
+1-byte payload zero checksum found:
+  Attempts: 9,235
+  IPs: 206.126.14.37 → 3.217.249.118
+  Ports: 55559 → 53216
+  Data: 7d
+
+2-byte payload zero checksum found:
+  Attempts: 19,994
+  IPs: 167.147.170.208 → 230.125.241.105
+  Ports: 31048 → 54493
+  Data: 8768
+
+3-byte payload zero checksum found:
+  Attempts: 29,182
+  IPs: 47.210.190.101 → 89.192.74.29
+  Ports: 31824 → 39564
+  Data: 74e5e2
+
+4-byte payload zero checksum found:
+  Attempts: 201,778
+  IPs: 13.148.124.131 → 41.83.186.12
+  Ports: 20417 → 35477
+  Data: 74014407
+
+5-byte payload zero checksum found:
+  Attempts: 91,780
+  IPs: 99.93.12.125 → 197.119.141.238
+  Ports: 16560 → 26099
+  Data: e0a6a7490e
+
+6-byte payload zero checksum found:
+  Attempts: 170,757
+  IPs: 99.220.32.108 → 74.116.180.12
+  Ports: 30406 → 6196
+  Data: 537426687432
+
+7-byte payload zero checksum found:
+  Attempts: 220,042
+  IPs: 21.73.170.151 → 163.130.70.219
+  Ports: 43682 → 43749
+  Data: b93d76d365f86a
+
+8-byte payload zero checksum found:
+  Attempts: 8,201
+  IPs: 66.48.190.225 → 206.144.19.189
+  Ports: 34355 → 35270
+  Data: 3a124aa71b4d6c6e
+
+9-byte payload zero checksum found:
+  Attempts: 40,796
+  IPs: 84.16.44.1 → 106.183.14.232
+  Ports: 57385 → 2382
+  Data: ba624023dbcecb4e7b
+
+============================================================
+SYSTEMATIC SEARCH IN CONSTRAINED SPACE
+============================================================
+
+Found 10 zero-checksum configurations
+Search space: 256 * 100 * 100 = 2,560,000 combinations
+Hit rate: 0.00000391
+
+First 10 configurations:
+  Ports 1000→1009, data: 0xe4
+  Ports 1001→1008, data: 0xe4
+  Ports 1002→1007, data: 0xe4
+  Ports 1003→1006, data: 0xe4
+  Ports 1004→1005, data: 0xe4
+  Ports 1005→1004, data: 0xe4
+  Ports 1006→1003, data: 0xe4
+  Ports 1007→1002, data: 0xe4
+  Ports 1008→1001, data: 0xe4
+  Ports 1009→1000, data: 0xe4
+
+============================================================
+STATISTICAL VALIDATION
+============================================================
+
+Running 10 trials of 100,000 random packets each:
+  Trial  1:   2 zeros, rate: 0.00002000
+  Trial  2:   0 zeros, rate: 0.00000000
+  Trial  3:   2 zeros, rate: 0.00002000
+  Trial  4:   1 zeros, rate: 0.00001000
+  Trial  5:   2 zeros, rate: 0.00002000
+  Trial  6:   4 zeros, rate: 0.00004000
+  Trial  7:   2 zeros, rate: 0.00002000
+  Trial  8:   0 zeros, rate: 0.00000000
+  Trial  9:   3 zeros, rate: 0.00003000
+  Trial 10:   2 zeros, rate: 0.00002000
+
+Summary Statistics:
+  Expected zeros per trial: 1.5259
+  Observed mean: 1.8000
+  Standard deviation: 1.1662
+  Min zeros: 0
+  Max zeros: 4
+  Deviation from expected: 17.96%
+
+============================================================
+ANALYSIS COMPLETE
+============================================================
