@@ -8897,8 +8897,8 @@ Require Import ExtrOcamlNatInt.
 (* Extract Coq types to OCaml *)
 Extract Inductive bool => "bool" [ "true" "false" ].
 Extract Inductive list => "list" [ "[]" "(::)" ].
-Extract Inductive prod => "(*)" [ "(,)" ].
-Extract Inductive sum => "(,) option" [ "(fun x -> (x, None))" "(fun e -> (None, Some e))" ].
+Extract Inductive prod => "( * )" [ "(,)" ].
+Extract Inductive sum => "result" [ "Ok" "Error" ].
 Extract Inductive option => "option" [ "Some" "None" ].
 Extract Inductive unit => "unit" [ "()" ].
 
@@ -8924,7 +8924,7 @@ Extract Inductive nat => "int"
   [ "0" "(fun n -> n + 1)" ]
   "(fun f0 fs n -> if n = 0 then f0 () else fs (n - 1))".
 
-(* Complete UDP Stack Extraction with all 37 sections *)
+(* Complete UDP Stack Extraction - All Sections *)
 Extraction "udp_final.ml"
   (* Core Protocol *)
   encode_udp_ipv4
@@ -8935,7 +8935,7 @@ Extraction "udp_final.ml"
   compute_udp_checksum_ipv6
   verify_checksum_ipv4
   verify_checksum_ipv6
-  
+
   (* Fragmentation *)
   reassemble_fragments
   reassemble_fragments_v6
@@ -8943,7 +8943,7 @@ Extraction "udp_final.ml"
   decode_udp_ipv6_fragmented
   fragment_packet
   send_udp_with_fragmentation
-  
+
   (* Socket API *)
   socket
   bind
@@ -8955,35 +8955,84 @@ Extraction "udp_final.ml"
   send_connected
   setsockopt
   getsockopt
-  
+  socket_connected
+
   (* Network Layer *)
   find_route
   send_packet
   receive_packet
   process_udp_rx
   send_udp
-  
-  (* Multicast *)
+  apply_mask
+  mask_prefix_len
+
+  (* Multicast - IGMPv2 *)
   join_mcast_group
   leave_mcast_group
   process_igmp_query
   join_mcast_group_v6
   send_mld_report
-  
+  is_ipv4_multicast
+  is_ipv6_multicast
+  build_igmp_report_packet
+  build_igmp_leave_packet
+  compute_igmp_checksum
+
+  (* Multicast - IGMPv3 SSM *)
+  join_ssm_group
+  leave_ssm_group
+  add_ssm_sources
+  block_ssm_sources
+  ssm_accept_packet
+  build_igmpv3_report
+  build_igmpv3_group_record
+  source_in_list
+
   (* NAT Traversal *)
   nat_outbound
   nat_inbound
   find_nat_mapping
+  find_reverse_mapping
   create_nat_mapping
   cleanup_nat_mappings
-  
-  (* Rate Limiting *)
+  allocate_external_port
+  port_in_use
+  prng_step
+  port_from_state
+
+  (* NAT Hairpinning *)
+  nat_hairpin
+  is_hairpin_dest
+  find_hairpin_target
+
+  (* Rate Limiting - Token Bucket *)
   check_rate_limit
   send_with_rate_limit
-  apply_congestion_control
   refill_bucket
   consume_tokens
-  
+
+  (* Rate Limiting - Leaky Bucket *)
+  enqueue_leaky
+  drain_leaky
+
+  (* ECN and Congestion Control *)
+  apply_congestion_control
+  set_ecn_in_ip_packet
+  get_ecn_from_ip_packet
+  ECN_NOT_ECT
+  ECN_ECT0
+  ECN_ECT1
+  ECN_CE
+
+  (* RFC 8085 Congestion Control *)
+  initial_congestion_state
+  on_loss
+  on_ecn_ce
+  on_ack
+  should_trigger_circuit_breaker
+  is_congestion_safe
+  max_packets_per_rtt
+
   (* Path MTU Discovery *)
   get_path_mtu
   process_icmp_too_big
@@ -8992,7 +9041,8 @@ Extraction "udp_final.ml"
   send_with_pmtu
   age_pmtu_entries
   default_pmtu_config
-  
+  find_pmtu_entry
+
   (* ICMP Generation *)
   generate_icmp_port_unreachable
   build_icmp_ip_packet
@@ -9002,8 +9052,8 @@ Extraction "udp_final.ml"
   should_send_icmp_rl
   ICMP_TYPE_DEST_UNREACHABLE
   ICMP_CODE_PORT_UNREACHABLE
-  
-  (* Jumbograms - NEW *)
+
+  (* Jumbograms *)
   encode_udp_ipv6_jumbo
   decode_udp_ipv6_jumbo
   parse_hop_by_hop
@@ -9018,29 +9068,83 @@ Extraction "udp_final.ml"
   MAX_JUMBO_PAYLOAD
   JumboError
   NetworkStackJumbo
-  
+
+  (* UDP-Lite RFC 3828 *)
+  udplite_header_bytes
+  udplite_header_words
+  checksum_words_udplite_ipv4
+  compute_udplite_checksum_ipv4
+  verify_udplite_checksum_ipv4
+  classify_coverage
+  MIN_COVERAGE
+  UdpLiteDecodeError
+
+  (* DTLS Integration RFC 6347 *)
+  initial_dtls_state
+  increment_epoch
+  advance_send_seq
+  double_timeout
+  is_replay
+  content_type_to_byte
+  byte_to_content_type
+  DTLS_EPOCH_SIZE
+  DTLS_SEQ_SIZE
+  DTLS_DEFAULT_PORT
+
+  (* Hardened Security *)
+  decode_udp_ipv4_hardened
+  decode_udp_ipv6_hardened
+  decode_udp_ipv4_with_addrs_hardened
+  normalize_bytes
+  ipv4_hardened_default
+  ipv4_hardened_with
+
   (* Configuration *)
   defaults_ipv4
   defaults_ipv6
-  ipv4_hardened_default
-  
+
   (* Tests *)
   run_all_tests.
 
 (** ****************************************************************************
 
+    ## Implementation Status
+
+    ### Completed Features
+    - Core UDP (RFC 768) with IPv4/IPv6 dual-stack
+    - UDP-Lite (RFC 3828) partial checksum coverage
+    - DTLS record layer integration (RFC 6347)
+    - IGMPv2/v3 multicast with SSM (RFC 3376)
+    - MLD/MLDv2 for IPv6 multicast
+    - Full NAT traversal (Full Cone, Restricted, Port Restricted, Symmetric)
+    - NAT hairpinning (RFC 4787)
+    - RFC 8085 congestion control guidelines
+    - ECN marking and congestion signaling
+    - Path MTU Discovery
+    - IPv6 Jumbograms (RFC 2675)
+    - Security-hardened decoder variants
+    - Complete socket API with options
+
     ## Future Work
-    
-    ### 1. Extraction and Testing
+
+    ### 1. Testing and Validation
     - QuickChick property-based testing framework
     - Performance benchmarks against standard implementations
-    
-    ### 2. Extended Protocols
-    - UDP-Lite (RFC 3828) with partial checksums
-    - DTLS integration for secure UDP
-    
-    ### 3. Formal Network Stack
-    - Integration with verified IP layer
-    - Composition with verified Ethernet
-    - Full verified socket API
+    - Fuzzing with afl-fuzz on extracted OCaml
+
+    ### 2. Protocol Extensions
+    - QUIC/HTTP3 integration layer
+    - SCTP-over-UDP tunneling
+    - WireGuard UDP encapsulation
+
+    ### 3. Verified Network Stack
+    - Integration with verified IP layer (e.g., CertiKOS)
+    - Composition with verified Ethernet framing
+    - End-to-end verified socket-to-wire path
+    - Hardware offload modeling (checksum, segmentation)
+
+    ### 4. Performance Optimization
+    - Verified zero-copy buffer management
+    - SIMD checksum computation proofs
+    - Lock-free queue extraction
     **************************************************************************** *)
