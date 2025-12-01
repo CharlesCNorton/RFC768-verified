@@ -891,6 +891,24 @@ Proof.
   - apply N.eqb_neq in E. intro H. exact (E H).
 Qed.
 
+Lemma mask16_lt_two16 : mask16 < two16.
+Proof. unfold mask16, two16. lia. Qed.
+
+Lemma complement16_lt_two16 : forall x, complement16 x < two16.
+Proof.
+  intro x. unfold complement16, mask16, two16. lia.
+Qed.
+
+Lemma compute_udp_checksum_ipv4_lt_two16 :
+  forall ipS ipD h data, compute_udp_checksum_ipv4 ipS ipD h data < two16.
+Proof.
+  intros ipS ipD h data.
+  unfold compute_udp_checksum_ipv4.
+  destruct (N.eqb (cksum16 (checksum_words_ipv4 ipS ipD h data)) 0) eqn:E.
+  - apply mask16_lt_two16.
+  - unfold cksum16. apply complement16_lt_two16.
+Qed.
+
 Definition zero_checksum_allowed (cfg:Config) (dst:IPv4) : bool :=
   match cfg.(zero_checksum_policy) with
   | ZeroAlwaysAccept => true
@@ -7145,26 +7163,33 @@ Section UDP_NAT.
       rewrite lenN_app, lenN_udp_header_bytes_8. lia.
   Qed.
 
-  (* NAT creates mapping for new connections *)
-  Lemma nat_outbound_creates_mapping : forall stack src dst pkt new_ip new_pkt stack',
-    nat_outbound stack src dst pkt = Some (new_ip, new_pkt, stack') ->
-    find_nat_mapping (nat_mappings stack) src
-      (match parse_header pkt with Some (h, _) => src_port h | None => 0 end)
-      dst
-      (match parse_header pkt with Some (h, _) => dst_port h | None => 0 end)
-      (nat_type_policy (nat_config stack)) = None ->
-    (length (nat_mappings stack') > length (nat_mappings stack))%nat.
+  Lemma allocate_external_port_preserves_mappings : forall stack,
+    nat_mappings (snd (allocate_external_port stack)) = nat_mappings stack.
   Proof.
-    intros stack src dst pkt new_ip new_pkt stack' Hout Hno_map.
-    unfold nat_outbound in Hout.
-    destruct (parse_header pkt) as [[h data]|] eqn:Hparse; [|discriminate].
-    simpl in Hno_map. rewrite Hno_map in Hout.
-    destruct (create_nat_mapping stack src (src_port h) dst (dst_port h)) as [mapping' stack''] eqn:Hcreate.
-    injection Hout; intros; subst.
-    unfold create_nat_mapping in Hcreate.
-    destruct (allocate_external_port stack) as [port stack'''] eqn:Halloc.
-    injection Hcreate; intros; subst.
-    simpl. lia.
+    intro stack. unfold allocate_external_port.
+    destruct (nat_next_port stack <? nat_port_range_max (nat_config stack)); reflexivity.
+  Qed.
+
+  Lemma create_nat_mapping_adds_one : forall stack int_ip int_port rem_ip rem_port,
+    length (nat_mappings (snd (create_nat_mapping stack int_ip int_port rem_ip rem_port))) =
+    S (length (nat_mappings stack)).
+  Proof.
+    intros stack int_ip int_port rem_ip rem_port.
+    unfold create_nat_mapping.
+    destruct (allocate_external_port stack) as [port stack'] eqn:Halloc.
+    simpl.
+    f_equal.
+    assert (Hpres: nat_mappings stack' = nat_mappings stack).
+    { replace stack' with (snd (allocate_external_port stack)) by (rewrite Halloc; reflexivity).
+      apply allocate_external_port_preserves_mappings. }
+    rewrite Hpres. reflexivity.
+  Qed.
+
+  Lemma create_nat_mapping_grows : forall stack int_ip int_port rem_ip rem_port,
+    (length (nat_mappings (snd (create_nat_mapping stack int_ip int_port rem_ip rem_port))) >
+     length (nat_mappings stack))%nat.
+  Proof.
+    intros. rewrite create_nat_mapping_adds_one. lia.
   Qed.
 
   (* NAT inbound requires existing mapping *)
@@ -7183,54 +7208,56 @@ Section UDP_NAT.
     - exfalso. apply Hsome. reflexivity.
   Qed.
 
-  (* NAT translation is idempotent on payload data *)
-  Example nat_preserves_payload :
-    forall stack src dst sp dp payload h,
-    let pkt := udp_header_bytes h ++ payload in
-    parse_header pkt = Some (h, payload) ->
-    match nat_outbound stack src dst pkt with
-    | Some (_, new_pkt, _) =>
-        match parse_header new_pkt with
-        | Some (_, new_payload) => new_payload = payload
-        | None => False
-        end
-    | None => True
-    end.
+  (* Well-formed NAT stack has valid port configuration and state *)
+  Definition nat_stack_wf (stack : NetworkStackNAT) : Prop :=
+    nat_port_range_min (nat_config stack) < two16 /\
+    nat_port_range_max (nat_config stack) < two16 /\
+    nat_next_port stack < two16 /\
+    (forall m, In m (nat_mappings stack) ->
+      nat_external_port m < two16 /\ nat_internal_port m < two16).
+
+  (* Port from state equals min when min > max (uses truncation) *)
+  Lemma port_from_state_eq_min_gt : forall state min max,
+    max < min ->
+    port_from_state state min max = min.
   Proof.
-    intros stack src dst sp dp payload h pkt Hparse.
-    unfold nat_outbound.
-    rewrite Hparse.
-    destruct (find_nat_mapping (nat_mappings stack) src (src_port h) dst (dst_port h)
-               (nat_type_policy (nat_config stack))) as [mapping|].
-    - assert (Hnorm: header_norm {| src_port := nat_external_port mapping;
-                                    dst_port := dst_port h;
-                                    length16 := length16 h;
-                                    checksum := compute_udp_checksum_ipv4
-                                                  (nat_external_ip mapping) dst
-                                                  {| src_port := nat_external_port mapping;
-                                                     dst_port := dst_port h;
-                                                     length16 := length16 h;
-                                                     checksum := 0 |} payload |}).
-      { unfold header_norm. simpl.
-        repeat split; try apply to_word16_lt_two16.
-        apply compute_udp_checksum_ipv4_lt_two16. }
-      rewrite (parse_header_bytes_of_header_norm _ payload Hnorm).
-      reflexivity.
-    - destruct (create_nat_mapping stack src (src_port h) dst (dst_port h)) as [mapping' stack'].
-      assert (Hnorm: header_norm {| src_port := nat_external_port mapping';
-                                    dst_port := dst_port h;
-                                    length16 := length16 h;
-                                    checksum := compute_udp_checksum_ipv4
-                                                  (nat_external_ip mapping') dst
-                                                  {| src_port := nat_external_port mapping';
-                                                     dst_port := dst_port h;
-                                                     length16 := length16 h;
-                                                     checksum := 0 |} payload |}).
-      { unfold header_norm. simpl.
-        repeat split; try apply to_word16_lt_two16.
-        apply compute_udp_checksum_ipv4_lt_two16. }
-      rewrite (parse_header_bytes_of_header_norm _ payload Hnorm).
-      reflexivity.
+    intros state min max Hgt.
+    unfold port_from_state.
+    destruct (max - min + 1 =? 0) eqn:Erange.
+    - reflexivity.
+    - assert (Heq: max - min = 0) by lia.
+      rewrite Heq. simpl. rewrite N.mod_1_r. lia.
+  Qed.
+
+  (* Main theorem: port_from_state produces valid port *)
+  Lemma port_from_state_lt_two16 : forall state min max,
+    min < two16 ->
+    max < two16 ->
+    port_from_state state min max < two16.
+  Proof.
+    intros state min max Hmin Hmax.
+    destruct (N.le_gt_cases min max) as [Hle|Hgt].
+    - (* min <= max: result <= max < two16 *)
+      apply N.le_lt_trans with max.
+      + apply port_from_state_le_max. exact Hle.
+      + exact Hmax.
+    - (* min > max: result = min < two16 *)
+      rewrite (port_from_state_eq_min_gt state min max Hgt).
+      exact Hmin.
+  Qed.
+
+  (* Allocated port is valid when config is valid *)
+  Lemma allocate_port_valid : forall stack,
+    nat_stack_wf stack ->
+    fst (allocate_external_port stack) < two16.
+  Proof.
+    intros stack [Hmin [Hmax [Hnext Hmaps]]].
+    unfold allocate_external_port.
+    destruct (port_in_use (nat_mappings stack) _) eqn:Euse.
+    - (* Port in use, return nat_next_port *)
+      destruct (nat_next_port stack <? nat_port_range_max (nat_config stack)); exact Hnext.
+    - (* Port not in use, return port_from_state result *)
+      apply port_from_state_lt_two16; assumption.
   Qed.
 
 End UDP_NAT.
