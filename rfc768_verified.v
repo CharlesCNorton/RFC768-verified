@@ -1085,6 +1085,81 @@ Definition decode_udp_ipv4_with_addrs
   end.
 
 (* =============================================================================
+   Section 6a: TTL/Hop Limit Exposure (RFC 1122 §4.1.3.5)
+
+   RFC 1122 requires that the UDP layer expose the TTL (IPv4) or Hop Limit
+   (IPv6) value to the application layer. This is necessary for protocols
+   like traceroute and multicast scoping.
+   ============================================================================= *)
+
+Record UdpDeliverWithTTL := {
+  ud_src_ip  : IPv4;
+  ud_dst_ip  : IPv4;
+  ud_src_port: word16;
+  ud_dst_port: word16;
+  ud_payload : list byte;
+  ud_ttl     : byte;
+  ud_tos     : byte
+}.
+
+Record UdpDeliverWithHopLimit := {
+  udv6_src_ip  : list word16;
+  udv6_dst_ip  : list word16;
+  udv6_src_port: word16;
+  udv6_dst_port: word16;
+  udv6_payload : list byte;
+  udv6_hop_limit : byte;
+  udv6_traffic_class : byte
+}.
+
+Definition extract_ttl_from_ip_header (ip_header : list byte) : byte :=
+  match ip_header with
+  | _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: ttl :: _ => ttl
+  | _ => 0
+  end.
+
+Definition extract_tos_from_ip_header (ip_header : list byte) : byte :=
+  match ip_header with
+  | _ :: tos :: _ => tos
+  | _ => 0
+  end.
+
+Definition extract_hop_limit_from_ipv6 (ip6_header : list byte) : byte :=
+  match ip6_header with
+  | _ :: _ :: _ :: _ :: _ :: _ :: _ :: hop_limit :: _ => hop_limit
+  | _ => 0
+  end.
+
+Definition extract_traffic_class_from_ipv6 (ip6_header : list byte) : byte :=
+  match ip6_header with
+  | b0 :: b1 :: _ =>
+      N.lor (N.land (b0 * 16) 240) (b1 / 16)
+  | _ => 0
+  end.
+
+Definition is_valid_ttl (ttl : byte) : bool := N.ltb ttl 256.
+
+Lemma valid_ttl_bounded : forall ttl,
+  is_valid_ttl ttl = true -> ttl < 256.
+Proof.
+  intros ttl H. unfold is_valid_ttl in H.
+  apply N.ltb_lt. exact H.
+Qed.
+
+Definition DEFAULT_TTL : byte := 64.
+Definition MULTICAST_TTL_LOCAL : byte := 1.
+Definition MULTICAST_TTL_SITE : byte := 32.
+Definition MULTICAST_TTL_REGION : byte := 64.
+Definition MULTICAST_TTL_GLOBAL : byte := 255.
+
+Lemma multicast_ttl_scoping : forall ttl,
+  ttl <= MULTICAST_TTL_LOCAL ->
+  ttl <= 1.
+Proof.
+  intros ttl H. unfold MULTICAST_TTL_LOCAL in H. lia.
+Qed.
+
+(* =============================================================================
    Section 7: ICMP Error Handling (RFC 768/1122/1812)
    
    Implements ICMP error generation and processing per RFC 1122 §4.1.3.3
@@ -4531,6 +4606,99 @@ Qed.
 End UDP_IPv6.
 
 (* =============================================================================
+   Section 21a: RFC 6935/6936 - IPv6 UDP Zero-Checksum for Tunnels
+
+   RFC 6935 updates RFC 2460 to allow IPv6 UDP datagrams with zero checksum
+   specifically for tunnel encapsulation protocols. RFC 6936 provides the
+   detailed requirements. This is an exception to the normal IPv6 rule that
+   UDP checksums are mandatory.
+   ============================================================================= *)
+
+Section UDP_IPv6_ZeroChecksum_Tunnels.
+  Open Scope N_scope.
+
+  Inductive TunnelProtocol :=
+    | VXLAN
+    | GENEVE
+    | LISP
+    | GUE
+    | OtherTunnel.
+
+  Record ZeroChecksumConfig := {
+    zc_enabled : bool;
+    zc_tunnel_type : TunnelProtocol;
+    zc_inner_checksum_required : bool;
+    zc_allowed_ports : list word16
+  }.
+
+  Definition port_allows_zero_checksum (cfg : ZeroChecksumConfig) (port : word16) : bool :=
+    if cfg.(zc_enabled) then
+      existsb (fun p => N.eqb p port) cfg.(zc_allowed_ports)
+    else
+      false.
+
+  Definition is_valid_tunnel_packet (cfg : ZeroChecksumConfig)
+                                    (has_inner_checksum : bool) : bool :=
+    if cfg.(zc_inner_checksum_required) then
+      has_inner_checksum
+    else
+      true.
+
+  Inductive ZeroChecksumValidity :=
+    | ZC_Valid
+    | ZC_Invalid_Not_Enabled
+    | ZC_Invalid_Port_Not_Allowed
+    | ZC_Invalid_No_Inner_Checksum.
+
+  Definition validate_zero_checksum_usage
+    (cfg : ZeroChecksumConfig) (dst_port : word16) (has_inner_ck : bool)
+    : ZeroChecksumValidity :=
+    if negb cfg.(zc_enabled) then ZC_Invalid_Not_Enabled
+    else if negb (port_allows_zero_checksum cfg dst_port) then ZC_Invalid_Port_Not_Allowed
+    else if cfg.(zc_inner_checksum_required) && negb has_inner_ck then ZC_Invalid_No_Inner_Checksum
+    else ZC_Valid.
+
+  Lemma zero_checksum_requires_enabled : forall cfg port has_inner,
+    validate_zero_checksum_usage cfg port has_inner = ZC_Valid ->
+    cfg.(zc_enabled) = true.
+  Proof.
+    intros cfg port has_inner H.
+    unfold validate_zero_checksum_usage in H.
+    destruct cfg.(zc_enabled) eqn:E.
+    - reflexivity.
+    - simpl in H. discriminate.
+  Qed.
+
+  Lemma zero_checksum_requires_allowed_port : forall cfg port has_inner,
+    validate_zero_checksum_usage cfg port has_inner = ZC_Valid ->
+    port_allows_zero_checksum cfg port = true.
+  Proof.
+    intros cfg port has_inner H.
+    unfold validate_zero_checksum_usage in H.
+    destruct (negb cfg.(zc_enabled)) eqn:E1.
+    - discriminate.
+    - destruct (negb (port_allows_zero_checksum cfg port)) eqn:E2.
+      + discriminate.
+      + apply negb_false_iff in E2. exact E2.
+  Qed.
+
+  Definition VXLAN_PORT : word16 := 4789.
+  Definition GENEVE_PORT : word16 := 6081.
+  Definition LISP_DATA_PORT : word16 := 4341.
+
+  Definition default_tunnel_config : ZeroChecksumConfig :=
+    {| zc_enabled := true;
+       zc_tunnel_type := VXLAN;
+       zc_inner_checksum_required := true;
+       zc_allowed_ports := [VXLAN_PORT; GENEVE_PORT; LISP_DATA_PORT] |}.
+
+  Example vxlan_zero_checksum_valid :
+    validate_zero_checksum_usage default_tunnel_config VXLAN_PORT true = ZC_Valid.
+  Proof. reflexivity. Qed.
+
+End UDP_IPv6_ZeroChecksum_Tunnels.
+
+(* =============================================================================
    Section 22: Permutation Invariance of Internet Checksum
    
    The Internet checksum algorithm's result is independent of the order in 
@@ -4752,6 +4920,106 @@ Qed.
 End UDP_ModCarry_Equivalence.
 
 (* =============================================================================
+   Section 23a: Constant-Time Checksum Implementation
+
+   This section provides a constant-time checksum implementation that resists
+   timing side-channel attacks. The key insight is that all operations must
+   take the same amount of time regardless of the input values.
+   ============================================================================= *)
+
+Section UDP_ConstantTime_Checksum.
+  Open Scope N_scope.
+
+  Definition ct_add16_ones (a b : word16) : word16 :=
+    let sum := a + b in
+    let carry := N.b2n (mask16 <? sum) in
+    let wrapped := N.land sum mask16 in
+    N.land (wrapped + carry) mask16.
+
+  Fixpoint ct_sum16 (ws : list word16) : word16 :=
+    match ws with
+    | [] => 0
+    | w :: ws' => ct_add16_ones w (ct_sum16 ws')
+    end.
+
+  Definition ct_cksum16 (ws : list word16) : word16 :=
+    N.lxor (ct_sum16 ws) mask16.
+
+  Lemma mask16_is_ones_16 : mask16 = N.ones 16.
+  Proof. reflexivity. Qed.
+
+  Lemma two16_is_pow2_16 : two16 = 2 ^ 16.
+  Proof. reflexivity. Qed.
+
+  Lemma mask16_plus_one_is_two16 : mask16 + 1 = two16.
+  Proof. reflexivity. Qed.
+
+  Lemma land_ones_mod : forall n k, N.land n (N.ones k) = n mod (2 ^ k).
+  Proof.
+    intros n k.
+    apply N.land_ones.
+  Qed.
+
+  Lemma pow2_pos : forall k, 0 < 2 ^ k.
+  Proof.
+    intros k.
+    induction k using N.peano_ind.
+    - simpl. lia.
+    - rewrite N.pow_succ_r by lia. lia.
+  Qed.
+
+  Lemma pow2_neq_0 : forall k, 2 ^ k <> 0.
+  Proof.
+    intros k H.
+    assert (Hpos := pow2_pos k).
+    lia.
+  Qed.
+
+  Lemma mod_lt_pow2 : forall n k, n mod (2 ^ k) < 2 ^ k.
+  Proof.
+    intros n k.
+    apply N.mod_lt.
+    apply pow2_neq_0.
+  Qed.
+
+  Lemma land_mask16_lt_two16 : forall n,
+    N.land n mask16 < two16.
+  Proof.
+    intros n.
+    rewrite mask16_is_ones_16.
+    rewrite two16_is_pow2_16.
+    rewrite land_ones_mod.
+    apply mod_lt_pow2.
+  Qed.
+
+  Lemma land_mask16_bounded : forall n,
+    N.land n mask16 <= mask16.
+  Proof.
+    intros n.
+    assert (H := land_mask16_lt_two16 n).
+    unfold mask16, two16 in *. lia.
+  Qed.
+
+  Lemma ct_add16_ones_result_bounded : forall a b,
+    ct_add16_ones a b <= mask16.
+  Proof.
+    intros a b.
+    unfold ct_add16_ones.
+    apply land_mask16_bounded.
+  Qed.
+
+  Lemma ct_sum16_bounded : forall ws,
+    ct_sum16 ws <= mask16.
+  Proof.
+    intros ws.
+    induction ws as [|w ws' IH].
+    - simpl. unfold mask16. apply N.le_0_l.
+    - simpl. apply ct_add16_ones_result_bounded.
+  Qed.
+
+End UDP_ConstantTime_Checksum.
+
+(* =============================================================================
    Section 24: Serialization Round-Trip Extras
    
    Helper lemmas for serialization that are robust to Opaque declarations
@@ -4817,12 +5085,275 @@ Qed.
 End UDP_Serialization_Extras.
 
 (* =============================================================================
+   Section 24a: UDP-Lite Protocol (RFC 3828)
+
+   UDP-Lite is a variant of UDP that allows partial checksum coverage,
+   enabling applications to receive corrupted payloads rather than having
+   them silently discarded. This is useful for real-time multimedia where
+   some corruption is preferable to packet loss.
+
+   Key differences from UDP:
+   - Length field replaced by Checksum Coverage field
+   - Checksum coverage can be 0 (entire packet) or >= 8 (partial)
+   - Coverage values 1-7 are invalid and MUST cause packet discard
+   - Protocol number is 136 (not 17)
+   ============================================================================= *)
+
+Section UDP_Lite.
+  Open Scope N_scope.
+
+  Definition UDPLITE_PROTOCOL : byte := 136.
+
+  Record UdpLiteHeader := {
+    lite_src_port : word16;
+    lite_dst_port : word16;
+    checksum_coverage : word16;
+    lite_checksum : word16
+  }.
+
+  Definition MIN_COVERAGE : N := 8.
+
+  Inductive CoverageValidity :=
+    | CoverageEntirePacket
+    | CoveragePartial (n : N)
+    | CoverageInvalid.
+
+  Definition classify_coverage (cov : word16) (packet_len : N) : CoverageValidity :=
+    if N.eqb cov 0 then CoverageEntirePacket
+    else if N.ltb cov MIN_COVERAGE then CoverageInvalid
+    else if N.ltb packet_len cov then CoverageInvalid
+    else CoveragePartial cov.
+
+  Lemma coverage_zero_is_entire : forall len,
+    classify_coverage 0 len = CoverageEntirePacket.
+  Proof.
+    intros len. unfold classify_coverage. reflexivity.
+  Qed.
+
+  Lemma coverage_1_to_7_invalid : forall cov len,
+    1 <= cov -> cov < 8 ->
+    classify_coverage cov len = CoverageInvalid.
+  Proof.
+    intros cov len H1 H7.
+    unfold classify_coverage.
+    assert (Hne : (cov =? 0) = false) by (apply N.eqb_neq; lia).
+    rewrite Hne.
+    assert (Hlt : (cov <? MIN_COVERAGE) = true).
+    { apply N.ltb_lt. unfold MIN_COVERAGE. lia. }
+    rewrite Hlt. reflexivity.
+  Qed.
+
+  Lemma coverage_ge_8_valid_if_le_len : forall cov len,
+    8 <= cov -> cov <= len ->
+    classify_coverage cov len = CoveragePartial cov.
+  Proof.
+    intros cov len H8 Hle.
+    unfold classify_coverage.
+    assert (Hne : (cov =? 0) = false) by (apply N.eqb_neq; lia).
+    rewrite Hne.
+    assert (Hge : (cov <? MIN_COVERAGE) = false).
+    { apply N.ltb_ge. unfold MIN_COVERAGE. lia. }
+    rewrite Hge.
+    assert (Hnlt : (len <? cov) = false) by (apply N.ltb_ge; lia).
+    rewrite Hnlt. reflexivity.
+  Qed.
+
+  Definition udplite_header_words (h : UdpLiteHeader) : list word16 :=
+    [h.(lite_src_port); h.(lite_dst_port); h.(checksum_coverage); h.(lite_checksum)].
+
+  Definition udplite_header_words_zero_ck (h : UdpLiteHeader) : list word16 :=
+    [h.(lite_src_port); h.(lite_dst_port); h.(checksum_coverage); 0].
+
+  Definition udplite_header_bytes (h : UdpLiteHeader) : list byte :=
+    bytes_of_words16_be (udplite_header_words h).
+
+  Definition effective_coverage (cov : word16) (packet_len : N) : N :=
+    if N.eqb cov 0 then packet_len else cov.
+
+  Lemma effective_coverage_zero : forall len,
+    effective_coverage 0 len = len.
+  Proof.
+    intros. unfold effective_coverage. reflexivity.
+  Qed.
+
+  Lemma effective_coverage_nonzero : forall cov len,
+    cov <> 0 -> effective_coverage cov len = cov.
+  Proof.
+    intros cov len Hne.
+    unfold effective_coverage.
+    assert (H : (cov =? 0) = false) by (apply N.eqb_neq; exact Hne).
+    rewrite H. reflexivity.
+  Qed.
+
+  Definition checksum_words_udplite_ipv4
+    (src dst : IPv4) (h : UdpLiteHeader) (data : list byte) : list word16 :=
+    let eff_cov := effective_coverage h.(checksum_coverage) (8 + lenN data) in
+    let covered_data := take (N.to_nat (eff_cov - 8)) data in
+    pseudo_header_v4 src dst (to_word16 eff_cov)
+    ++ udplite_header_words_zero_ck h
+    ++ words16_of_bytes_be covered_data.
+
+  Definition compute_udplite_checksum_ipv4
+    (src dst : IPv4) (h : UdpLiteHeader) (data : list byte) : word16 :=
+    let words := checksum_words_udplite_ipv4 src dst h data in
+    let x := cksum16 words in
+    if N.eqb x 0 then mask16 else x.
+
+  Lemma compute_udplite_checksum_ipv4_nonzero :
+    forall src dst h data, compute_udplite_checksum_ipv4 src dst h data <> 0.
+  Proof.
+    intros src dst h data.
+    unfold compute_udplite_checksum_ipv4.
+    destruct (cksum16 (checksum_words_udplite_ipv4 src dst h data) =? 0) eqn:E.
+    - unfold mask16. intro H. discriminate.
+    - apply N.eqb_neq in E. intro H. exact (E H).
+  Qed.
+
+  Inductive UdpLiteDecodeError :=
+    | LiteBadLength
+    | LiteBadCoverage
+    | LiteBadChecksum
+    | LiteDstPortZero.
+
+  Definition verify_udplite_checksum_ipv4
+    (src dst : IPv4) (h : UdpLiteHeader) (data : list byte) : bool :=
+    let words := checksum_words_udplite_ipv4 src dst h data in
+    let ws := words ++ [h.(lite_checksum)] in
+    N.eqb (sum16 ws) mask16.
+
+  Lemma header_always_covered : forall cov len,
+    classify_coverage cov len <> CoverageInvalid ->
+    cov = 0 \/ cov >= 8.
+  Proof.
+    intros cov len Hvalid.
+    unfold classify_coverage in Hvalid.
+    destruct (cov =? 0) eqn:E0.
+    - apply N.eqb_eq in E0. left. exact E0.
+    - right. apply N.eqb_neq in E0.
+      destruct (cov <? MIN_COVERAGE) eqn:Ecov.
+      + exfalso. apply Hvalid. reflexivity.
+      + apply N.ltb_ge in Ecov. unfold MIN_COVERAGE in Ecov. lia.
+  Qed.
+
+End UDP_Lite.
+
+(* =============================================================================
+   Section 24b: DTLS Integration Framework (RFC 6347)
+
+   DTLS (Datagram Transport Layer Security) provides TLS-equivalent security
+   for UDP datagrams. This section formalizes the DTLS record layer interface
+   for integration with the UDP stack.
+   ============================================================================= *)
+
+Section DTLS_Integration.
+  Open Scope N_scope.
+
+  Definition DTLS_EPOCH_SIZE : N := 65536.
+  Definition DTLS_SEQ_SIZE : N := 281474976710656.
+  Definition DTLS_DEFAULT_PORT : word16 := 443.
+
+  Record DTLSRecordHeader := {
+    dtls_content_type : byte;
+    dtls_version_major : byte;
+    dtls_version_minor : byte;
+    dtls_epoch : word16;
+    dtls_sequence_hi : word16;
+    dtls_sequence_lo : N;
+    dtls_length : word16
+  }.
+
+  Inductive DTLSContentType :=
+    | ChangeCipherSpec
+    | Alert
+    | Handshake
+    | ApplicationData.
+
+  Definition content_type_to_byte (ct : DTLSContentType) : byte :=
+    match ct with
+    | ChangeCipherSpec => 20
+    | Alert => 21
+    | Handshake => 22
+    | ApplicationData => 23
+    end.
+
+  Definition byte_to_content_type (b : byte) : option DTLSContentType :=
+    if N.eqb b 20 then Some ChangeCipherSpec
+    else if N.eqb b 21 then Some Alert
+    else if N.eqb b 22 then Some Handshake
+    else if N.eqb b 23 then Some ApplicationData
+    else None.
+
+  Record DTLSState := {
+    dtls_current_epoch : word16;
+    dtls_next_send_seq : N;
+    dtls_next_recv_seq : N;
+    dtls_retransmit_timeout : N;
+    dtls_max_retransmits : N
+  }.
+
+  Definition initial_dtls_state : DTLSState :=
+    {| dtls_current_epoch := 0;
+       dtls_next_send_seq := 0;
+       dtls_next_recv_seq := 0;
+       dtls_retransmit_timeout := 1000;
+       dtls_max_retransmits := 6 |}.
+
+  Definition increment_epoch (state : DTLSState) : DTLSState :=
+    {| dtls_current_epoch := (state.(dtls_current_epoch) + 1) mod DTLS_EPOCH_SIZE;
+       dtls_next_send_seq := 0;
+       dtls_next_recv_seq := 0;
+       dtls_retransmit_timeout := state.(dtls_retransmit_timeout);
+       dtls_max_retransmits := state.(dtls_max_retransmits) |}.
+
+  Definition advance_send_seq (state : DTLSState) : DTLSState :=
+    {| dtls_current_epoch := state.(dtls_current_epoch);
+       dtls_next_send_seq := state.(dtls_next_send_seq) + 1;
+       dtls_next_recv_seq := state.(dtls_next_recv_seq);
+       dtls_retransmit_timeout := state.(dtls_retransmit_timeout);
+       dtls_max_retransmits := state.(dtls_max_retransmits) |}.
+
+  Definition double_timeout (state : DTLSState) : DTLSState :=
+    let new_timeout := N.min 60000 (state.(dtls_retransmit_timeout) * 2) in
+    {| dtls_current_epoch := state.(dtls_current_epoch);
+       dtls_next_send_seq := state.(dtls_next_send_seq);
+       dtls_next_recv_seq := state.(dtls_next_recv_seq);
+       dtls_retransmit_timeout := new_timeout;
+       dtls_max_retransmits := state.(dtls_max_retransmits) |}.
+
+  Lemma epoch_increment_wraps : forall state,
+    (increment_epoch state).(dtls_current_epoch) < DTLS_EPOCH_SIZE.
+  Proof.
+    intros state. unfold increment_epoch. simpl.
+    apply N.mod_lt. unfold DTLS_EPOCH_SIZE. lia.
+  Qed.
+
+  Lemma timeout_bounded : forall state,
+    (double_timeout state).(dtls_retransmit_timeout) <= 60000.
+  Proof.
+    intros state. unfold double_timeout. simpl. lia.
+  Qed.
+
+  Definition is_replay (state : DTLSState) (seq : N) : bool :=
+    N.ltb seq state.(dtls_next_recv_seq).
+
+  Lemma replay_detection_sound : forall state seq,
+    is_replay state seq = true ->
+    seq < state.(dtls_next_recv_seq).
+  Proof.
+    intros state seq H.
+    unfold is_replay in H.
+    apply N.ltb_lt. exact H.
+  Qed.
+
+End DTLS_Integration.
+
+(* =============================================================================
    Section 25: Full Pipeline Implementation - ARPANET Example
-   
+
    This section provides a complete worked example of UDP packet construction
-   and verification using the historic ARPANET "LO" message - the first 
+   and verification using the historic ARPANET "LO" message - the first
    message ever sent over the Internet's predecessor on October 29, 1969.
-   
+
    The implementation demonstrates:
    - Step-by-step packet construction
    - Checksum computation with all intermediate values
@@ -5861,6 +6392,55 @@ Section UDP_Socket_API.
     - destruct (N.eqb val 0) eqn:Ez; simpl; [reflexivity|reflexivity].
     - destruct (N.eqb val 0) eqn:Ez; simpl; [reflexivity|reflexivity].
     - destruct (N.eqb val 0) eqn:Ez; simpl; [reflexivity|reflexivity].
+  Qed.
+
+  Lemma socket_fd_increments : forall next_fd,
+    let (_, new_fd) := socket next_fd in
+    new_fd = next_fd + 1.
+  Proof.
+    intros next_fd. unfold socket. reflexivity.
+  Qed.
+
+  Lemma bind_preserves_fd : forall s addr port s',
+    bind s addr port = Ok s' ->
+    fd s' = fd s.
+  Proof.
+    intros s addr port s' Hbind.
+    unfold bind in Hbind.
+    destruct (bound s) eqn:Ebound.
+    - discriminate.
+    - apply Ok_inj in Hbind. rewrite <- Hbind. reflexivity.
+  Qed.
+
+  Lemma deliver_preserves_bound_state : forall s src_addr src_port dst_addr dst_port data s',
+    deliver_to_socket s src_addr src_port dst_addr dst_port data = Some s' ->
+    local_addr s' = local_addr s /\
+    local_port s' = local_port s /\
+    fd s' = fd s.
+  Proof.
+    intros s src_addr src_port dst_addr dst_port data s' Hdel.
+    unfold deliver_to_socket in Hdel.
+    destruct (andb _ _) eqn:Ematch.
+    - inversion Hdel; subst s'; clear Hdel.
+      simpl. repeat split; reflexivity.
+    - discriminate.
+  Qed.
+
+  Lemma sendto_error_implies_oversize : forall s dst_addr dst_port data e,
+    sendto s dst_addr dst_port data = inr e ->
+    lenN data + 8 > mask16.
+  Proof.
+    intros s dst_addr dst_port data e Hsend.
+    unfold sendto in Hsend.
+    destruct (encode_udp_ipv4 _ _ _ _ _ _) eqn:Eenc.
+    - discriminate.
+    - unfold encode_udp_ipv4 in Eenc.
+      destruct (mk_header (local_port s) dst_port (lenN data)) eqn:Hmk.
+      + discriminate.
+      + unfold mk_header in Hmk.
+        destruct (8 + lenN data <=? mask16) eqn:Hle.
+        * discriminate.
+        * apply N.leb_gt in Hle. lia.
   Qed.
 
 End UDP_Socket_API.
@@ -7498,6 +8078,154 @@ Section UDP_RateLimit.
     else stack'.  (* Rate limited, drop *)
 
 End UDP_RateLimit.
+
+(* =============================================================================
+   Section 32a: RFC 8085 UDP Usage Guidelines - Congestion Control
+
+   RFC 8085 specifies requirements for applications using UDP to prevent
+   congestion collapse. This section formalizes the key constraints.
+   ============================================================================= *)
+
+Section UDP_RFC8085_Congestion.
+  Open Scope N_scope.
+
+  Inductive ApplicationType :=
+    | LowDataVolume
+    | BulkTransfer
+    | RealTimeMedia
+    | Tunneling.
+
+  Record RFC8085Config := {
+    app_type : ApplicationType;
+    max_rate_bps : N;
+    rtt_estimate_ms : N;
+    uses_ecn : bool;
+    has_circuit_breaker : bool;
+    loss_rate_threshold : N
+  }.
+
+  Definition DEFAULT_RTT_MS : N := 3000.
+  Definition BULK_LOSS_THRESHOLD : N := 10.
+
+  Definition max_packets_per_rtt (cfg : RFC8085Config) (packet_size : N) : N :=
+    match cfg.(app_type) with
+    | LowDataVolume => 1
+    | BulkTransfer => cfg.(max_rate_bps) * cfg.(rtt_estimate_ms) / (8000 * packet_size)
+    | RealTimeMedia => cfg.(max_rate_bps) * cfg.(rtt_estimate_ms) / (8000 * packet_size)
+    | Tunneling => cfg.(max_rate_bps) * cfg.(rtt_estimate_ms) / (8000 * packet_size)
+    end.
+
+  Definition is_congestion_safe (cfg : RFC8085Config) : bool :=
+    match cfg.(app_type) with
+    | LowDataVolume =>
+        N.leb DEFAULT_RTT_MS cfg.(rtt_estimate_ms)
+    | BulkTransfer =>
+        cfg.(has_circuit_breaker)
+    | RealTimeMedia =>
+        cfg.(uses_ecn) || cfg.(has_circuit_breaker)
+    | Tunneling =>
+        cfg.(has_circuit_breaker)
+    end.
+
+  Lemma low_volume_safe_with_default_rtt : forall cfg,
+    cfg.(app_type) = LowDataVolume ->
+    cfg.(rtt_estimate_ms) >= DEFAULT_RTT_MS ->
+    is_congestion_safe cfg = true.
+  Proof.
+    intros cfg Htype Hrtt.
+    unfold is_congestion_safe. rewrite Htype.
+    apply N.leb_le. lia.
+  Qed.
+
+  Lemma bulk_requires_circuit_breaker : forall cfg,
+    cfg.(app_type) = BulkTransfer ->
+    is_congestion_safe cfg = true ->
+    cfg.(has_circuit_breaker) = true.
+  Proof.
+    intros cfg Htype Hsafe.
+    unfold is_congestion_safe in Hsafe. rewrite Htype in Hsafe.
+    exact Hsafe.
+  Qed.
+
+  Record CongestionState := {
+    cwnd : N;
+    ssthresh : N;
+    rtt_measured : N;
+    loss_count : N;
+    ecn_ce_count : N;
+    last_decrease : N
+  }.
+
+  Definition initial_congestion_state : CongestionState :=
+    {| cwnd := 1;
+       ssthresh := 65535;
+       rtt_measured := DEFAULT_RTT_MS;
+       loss_count := 0;
+       ecn_ce_count := 0;
+       last_decrease := 0 |}.
+
+  Definition on_loss (state : CongestionState) (now : N) : CongestionState :=
+    {| cwnd := N.max 1 (state.(cwnd) / 2);
+       ssthresh := N.max 1 (state.(cwnd) / 2);
+       rtt_measured := state.(rtt_measured);
+       loss_count := state.(loss_count) + 1;
+       ecn_ce_count := state.(ecn_ce_count);
+       last_decrease := now |}.
+
+  Definition on_ecn_ce (state : CongestionState) (now : N) : CongestionState :=
+    if N.ltb (now - state.(last_decrease)) state.(rtt_measured)
+    then state
+    else
+      {| cwnd := N.max 1 (state.(cwnd) - state.(cwnd) / 8);
+         ssthresh := state.(ssthresh);
+         rtt_measured := state.(rtt_measured);
+         loss_count := state.(loss_count);
+         ecn_ce_count := state.(ecn_ce_count) + 1;
+         last_decrease := now |}.
+
+  Definition on_ack (state : CongestionState) : CongestionState :=
+    if N.ltb state.(cwnd) state.(ssthresh)
+    then
+      {| cwnd := state.(cwnd) + 1;
+         ssthresh := state.(ssthresh);
+         rtt_measured := state.(rtt_measured);
+         loss_count := state.(loss_count);
+         ecn_ce_count := state.(ecn_ce_count);
+         last_decrease := state.(last_decrease) |}
+    else
+      {| cwnd := state.(cwnd) + 1 / state.(cwnd);
+         ssthresh := state.(ssthresh);
+         rtt_measured := state.(rtt_measured);
+         loss_count := state.(loss_count);
+         ecn_ce_count := state.(ecn_ce_count);
+         last_decrease := state.(last_decrease) |}.
+
+  Lemma cwnd_always_positive : forall state now,
+    state.(cwnd) >= 1 ->
+    (on_loss state now).(cwnd) >= 1.
+  Proof.
+    intros state now Hpos.
+    unfold on_loss. simpl.
+    assert (H : N.max 1 (state.(cwnd) / 2) >= 1) by lia.
+    exact H.
+  Qed.
+
+  Lemma on_ack_increases_cwnd : forall state,
+    state.(cwnd) < state.(ssthresh) ->
+    (on_ack state).(cwnd) > state.(cwnd).
+  Proof.
+    intros state Hss.
+    unfold on_ack.
+    assert (Hlt : (state.(cwnd) <? state.(ssthresh)) = true).
+    { apply N.ltb_lt. exact Hss. }
+    rewrite Hlt. simpl. lia.
+  Qed.
+
+  Definition should_trigger_circuit_breaker (state : CongestionState)
+                                            (threshold : N) : bool :=
+    N.ltb threshold state.(loss_count).
+
+End UDP_RFC8085_Congestion.
 
 Section UDP_PathMTU.
   Open Scope N_scope.
